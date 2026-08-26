@@ -37,6 +37,7 @@ struct ProxyStateData: Codable {
     let available: Bool
     let name: String?
     let source: String?
+    let detail: String?
 }
 
 struct CodexActivity: Codable {
@@ -471,6 +472,10 @@ class CardView: NSView {
             guard let side = side else { continue }
             if !first { items.append(.divider) }
             first = false
+            if !side.ok, (side.error ?? "").contains("未检测到 Codex") {
+                items.append(.error("未检测到 Codex；登录后显示额度"))
+                continue
+            }
             items.append(.title(label, side.level, side.stale ?? false))
             if side.ok {
                 items.append(contentsOf: (side.windows ?? []).map { .win($0) })
@@ -518,8 +523,13 @@ class CardView: NSView {
         if let proxy = diagnostics?.proxy, proxy.available, let name = proxy.name, !name.isEmpty {
             proxyValue = name.trimmingCharacters(in: .whitespacesAndNewlines)
             proxyColor = greenColor
+        } else if tun?.state == "unavailable",
+                  let detail = tun?.detail,
+                  detail.contains("Clash Verge") {
+            proxyValue = "—"
+            proxyColor = dimColor
         } else {
-            proxyValue = "不可用"
+            proxyValue = diagnostics?.proxy?.detail ?? "不可用"
             proxyColor = orangeColor
         }
 
@@ -545,17 +555,22 @@ class CardView: NSView {
             codexColor = orangeColor
         }
 
-        let result = diagnosis()
-        return [
+        var items: [Item] = [
             .divider,
             .title("连接诊断", nil, false),
             .metric("TUN", tunValue, tunColor),
             .metric("代理", proxyValue, proxyColor),
             .metric("网络", networkValue, networkColor),
             .latencyChart,
-            .metric("Codex", codexValue, codexColor),
-            .diagnosis(result.title, result.detail, result.color),
         ]
+        if codex?.available == false {
+            items.append(.diagnosis("仅网络监测", "未检测到 Codex", faintColor))
+        } else {
+            let result = diagnosis()
+            items.append(.metric("Codex", codexValue, codexColor))
+            items.append(.diagnosis(result.title, result.detail, result.color))
+        }
+        return items
     }
 
     private func shortModel(_ model: String?) -> String {

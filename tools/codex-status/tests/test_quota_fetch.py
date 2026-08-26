@@ -15,6 +15,14 @@ import quota_fetch  # noqa: E402
 
 
 class QuotaFetchTests(unittest.TestCase):
+    def test_missing_codex_login_has_compact_degradation_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = os.path.join(directory, "auth.json")
+            with self.assertRaisesRegex(quota_fetch.FetchError, "未检测到 Codex"):
+                quota_fetch.fetch_gpt_codex(
+                    {"auth_json": missing}, timeout=1, proxy=None
+                )
+
     def test_config_failure_is_exposed_as_gpt_error(self):
         old_path = quota_fetch.CONFIG_PATH
         try:

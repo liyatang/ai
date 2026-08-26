@@ -96,7 +96,7 @@ def fetch_gpt_codex(gcfg, timeout, proxy):
         with open(path) as f:
             auth = json.load(f)
     except OSError:
-        raise FetchError("未找到 ~/.codex/auth.json（请安装 Codex CLI 并 codex login）")
+        raise FetchError("未检测到 Codex 登录（请安装 Codex 并 codex login）")
     tokens = auth.get("tokens") or {}
     token, acct = tokens.get("access_token"), tokens.get("account_id")
     if not token:

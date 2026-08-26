@@ -7,7 +7,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from diagnostics import TARGET_CLIENT, TARGET_OUTPUT, TARGET_RETRY, TARGET_WEBSOCKET, _decode_chunked, analyze_codex_rows, evaluate_tun, read_codex_activity, read_tun_state, resolve_proxy_state  # noqa: E402
+from diagnostics import TARGET_CLIENT, TARGET_OUTPUT, TARGET_RETRY, TARGET_WEBSOCKET, _decode_chunked, analyze_codex_rows, evaluate_tun, read_codex_activity, read_proxy_state, read_tun_state, resolve_proxy_state  # noqa: E402
 
 TURN_A = "01a00000-0000-7000-8000-000000000001"
 TURN_B = "01a00000-0000-7000-8000-000000000002"
@@ -127,7 +127,18 @@ class DiagnosticsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             missing_socket = os.path.join(directory, "missing.sock")
-            self.assertEqual(read_tun_state(missing_socket)["state"], "unavailable")
+            missing_app = (os.path.join(directory, "Clash Verge.app"),)
+            tun = read_tun_state(missing_socket, missing_app)
+            self.assertEqual(tun["state"], "unavailable")
+            self.assertEqual(tun["detail"], "未安装 Clash Verge")
+            proxy = read_proxy_state(missing_socket, missing_app)
+            self.assertEqual(proxy["detail"], "未安装 Clash Verge")
+
+            os.mkdir(missing_app[0])
+            self.assertEqual(
+                read_tun_state(missing_socket, missing_app)["detail"],
+                "Clash Verge 未连接",
+            )
 
     def test_proxy_prefers_live_chatgpt_leaf(self):
         result = resolve_proxy_state(

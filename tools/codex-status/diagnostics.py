@@ -22,6 +22,12 @@ from typing import Any
 
 LOG_PATH = os.path.expanduser("~/.codex/logs_2.sqlite")
 MIHOMO_SOCKET = "/tmp/verge/verge-mihomo.sock"
+CLASH_APP_PATHS = (
+    "/Applications/Clash Verge.app",
+    "/Applications/Clash Verge Rev.app",
+    os.path.expanduser("~/Applications/Clash Verge.app"),
+    os.path.expanduser("~/Applications/Clash Verge Rev.app"),
+)
 ACTIVITY_SECONDS = 300
 MAX_ROWS = 20_000
 
@@ -249,9 +255,18 @@ def evaluate_tun(config: dict[str, Any], route_output: str, interface_output: st
     return {"state": "enabled", "detail": f"已开启 · {device}"}
 
 
-def read_tun_state(socket_path: str = MIHOMO_SOCKET) -> dict[str, Any]:
+def clash_unavailable_detail(app_paths: tuple[str, ...] = CLASH_APP_PATHS) -> str:
+    if any(os.path.exists(path) for path in app_paths):
+        return "Clash Verge 未连接"
+    return "未安装 Clash Verge"
+
+
+def read_tun_state(
+    socket_path: str = MIHOMO_SOCKET,
+    app_paths: tuple[str, ...] = CLASH_APP_PATHS,
+) -> dict[str, Any]:
     if not os.path.exists(socket_path):
-        return {"state": "unavailable", "detail": "无法连接 mihomo"}
+        return {"state": "unavailable", "detail": clash_unavailable_detail(app_paths)}
     try:
         config = _unix_http_json(socket_path, "/configs")
         tun = config.get("tun") or {}
@@ -298,15 +313,28 @@ def resolve_proxy_state(proxies_payload: dict[str, Any], connections_payload: di
     return {"available": False, "name": None, "source": "unavailable"}
 
 
-def read_proxy_state(socket_path: str = MIHOMO_SOCKET) -> dict[str, Any]:
+def read_proxy_state(
+    socket_path: str = MIHOMO_SOCKET,
+    app_paths: tuple[str, ...] = CLASH_APP_PATHS,
+) -> dict[str, Any]:
     if not os.path.exists(socket_path):
-        return {"available": False, "name": None, "source": "unavailable"}
+        return {
+            "available": False,
+            "name": None,
+            "source": "unavailable",
+            "detail": clash_unavailable_detail(app_paths),
+        }
     try:
         proxies = _unix_http_json(socket_path, "/proxies", timeout=0.4)
         connections = _unix_http_json(socket_path, "/connections", timeout=0.4)
         return resolve_proxy_state(proxies, connections)
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
-        return {"available": False, "name": None, "source": "unavailable"}
+        return {
+            "available": False,
+            "name": None,
+            "source": "unavailable",
+            "detail": "Clash Verge 状态不可用",
+        }
 
 
 def collect(log_path: str = LOG_PATH, now: float | None = None) -> dict[str, Any]:
