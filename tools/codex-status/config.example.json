@@ -1,0 +1,9 @@
+{
+  "gpt": {
+    "mode": "codex",
+    "auth_json": "~/.codex/auth.json"
+  },
+  "proxy": null,
+  "timeout_seconds": 20
+}
+
