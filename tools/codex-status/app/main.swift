@@ -1109,7 +1109,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 锚定屏幕：默认主显示器；config.json 加 "anchor_screen":"mouse" 可跟随鼠标所在屏
+    /// 系统主显示器的全局坐标原点固定为 (0, 0)。NSScreen.main 会随键盘焦点变化，
+    /// 对不激活的悬浮窗并不稳定，因此不能用于固定主屏定位。
+    private func primaryScreen() -> NSScreen? {
+        NSScreen.screens.first {
+            abs($0.frame.origin.x) < 0.5 && abs($0.frame.origin.y) < 0.5
+        } ?? NSScreen.screens.first
+    }
+
+    /// 锚定屏幕：默认系统主显示器；config.json 加 "anchor_screen":"mouse" 可跟随鼠标所在屏
     func anchorScreen() -> NSScreen? {
         let cfgURL = URL(fileURLWithPath: NSHomeDirectory() + "/.config/quota-widget/config.json")
         if let data = try? Data(contentsOf: cfgURL),
@@ -1117,9 +1125,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
            let mode = cfg["anchor_screen"] as? String, mode == "mouse" {
             let m = NSEvent.mouseLocation
             return NSScreen.screens.first { NSMouseInRect(m, $0.frame, false) }
-                ?? NSScreen.main ?? NSScreen.screens.first
+                ?? primaryScreen()
         }
-        return NSScreen.main ?? NSScreen.screens.first
+        return primaryScreen()
     }
 
     /// 锚在所选屏幕可视区左上角
