@@ -8,7 +8,7 @@
 - Clash/mihomo TUN 是否真正生效、当前 AI 代理节点
 - ChatGPT 网络延迟、Codex 最近五分钟首输出等待和保守诊断
 - CPU、内存、实时上下行网速
-- 最近三分钟的 ChatGPT 延迟与网络速度滚动图
+- 连接诊断中的 ChatGPT 延迟图，以及系统区的网络速度滚动图（最近三分钟）
 
 ## 用 Codex 安装（推荐）
 
@@ -84,4 +84,3 @@ python3 -m unittest discover -s tests -v
 ```
 
 诊断术语与边界见 [CONTEXT.md](CONTEXT.md)。
-

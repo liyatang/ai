@@ -452,10 +452,11 @@ class CardView: NSView {
         case win(QuotaWindow)
         case error(String)
         case metric(String, String, NSColor) // 名称, 值, 状态色
+        case latencyChart                    // 连接诊断：ChatGPT 延迟趋势
         case diagnosis(String, String, NSColor)
         case sysBar(String, String, Int)    // 名称, 说明, 百分比（带进度条）
         case sysNet(String)                 // 右侧"↓ ↓"速度文本
-        case trendCharts                    // 底部统一趋势区：延迟 + 下载/上传
+        case netChart                       // 系统区：下载/上传趋势
     }
 
     private func buildItems(_ d: QuotaData) -> [Item] {
@@ -546,6 +547,7 @@ class CardView: NSView {
             .metric("TUN", tunValue, tunColor),
             .metric("代理", proxyValue, proxyColor),
             .metric("网络", networkValue, networkColor),
+            .latencyChart,
             .metric("Codex", codexValue, codexColor),
             .diagnosis(result.title, result.detail, result.color),
         ]
@@ -603,7 +605,7 @@ class CardView: NSView {
             .sysBar("CPU", "\(ProcessInfo.processInfo.activeProcessorCount) 核", s.cpuPct),
             .sysBar("内存", "\(fmtGB(s.memUsed))/\(fmtGB(s.memTotal))", memPct),
             .sysNet("↓ \(fmtRate(s.downBps))  ↑ \(fmtRate(s.upBps))"),
-            .trendCharts,
+            .netChart,
         ]
     }
 
@@ -820,10 +822,11 @@ class CardView: NSView {
         case .win: return 34
         case .error: return 22
         case .metric: return 24
+        case .latencyChart: return 71
         case .diagnosis: return 36
         case .sysBar: return 34
         case .sysNet: return 23
-        case .trendCharts: return 146
+        case .netChart: return 75
         }
     }
 
@@ -949,6 +952,10 @@ class CardView: NSView {
                 t.draw(at: NSPoint(x: cardWidth - padX - size.width, y: y + 4))
                 y += itemHeight(item)
 
+            case .latencyChart:
+                drawLatencyChart(at: y, width: contentW)
+                y += itemHeight(item)
+
             case .diagnosis(let title, let detail, let color):
                 attrString(title, size: 13, weight: .semibold, color: color)
                     .draw(at: NSPoint(x: padX, y: y + 2))
@@ -987,9 +994,8 @@ class CardView: NSView {
                 t.draw(at: NSPoint(x: cardWidth - padX - tsz.width, y: y + 4))
                 y += itemHeight(item)
 
-            case .trendCharts:
-                drawLatencyChart(at: y, width: contentW)
-                drawNetworkChart(at: y + 71, width: contentW)
+            case .netChart:
+                drawNetworkChart(at: y, width: contentW)
                 y += itemHeight(item)
             }
         }
