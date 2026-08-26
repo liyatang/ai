@@ -11,6 +11,8 @@ import json
 import os
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +26,20 @@ class FetchError(Exception):
     pass
 
 
+def _origin(url):
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
+    default_port = 443 if scheme == "https" else 80 if scheme == "http" else None
+    return scheme, (parsed.hostname or "").lower(), parsed.port or default_port
+
+
+class SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if _origin(req.full_url) != _origin(newurl):
+            raise FetchError("拒绝跨域重定向，未转发认证信息")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def http_json(url, headers=None, timeout=20, proxy=None, cookie=None):
     h = {"User-Agent": UA, "Accept": "application/json"}
     if headers:
@@ -31,7 +47,7 @@ def http_json(url, headers=None, timeout=20, proxy=None, cookie=None):
     if cookie:
         h["Cookie"] = cookie
     req = urllib.request.Request(url, headers=h)
-    handlers = []
+    handlers = [SameOriginRedirectHandler()]
     if proxy:
         handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
     opener = urllib.request.build_opener(*handlers)
@@ -144,7 +160,10 @@ def main():
     try:
         cfg = load_config()
     except Exception as e:
-        print(json.dumps({"updated": 0, "errors": [f"配置读取失败: {e}"]}))
+        print(json.dumps({
+            "updated": 0,
+            "gpt": {"ok": False, "error": f"配置读取失败: {e}", "windows": []},
+        }, ensure_ascii=False))
         return
     timeout = cfg.get("timeout_seconds", 20)
     proxy = cfg.get("proxy")

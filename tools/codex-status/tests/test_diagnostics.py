@@ -7,7 +7,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from diagnostics import TARGET_OUTPUT, TARGET_RETRY, TARGET_WEBSOCKET, _decode_chunked, analyze_codex_rows, evaluate_tun, read_codex_activity, read_tun_state, resolve_proxy_state  # noqa: E402
+from diagnostics import TARGET_CLIENT, TARGET_OUTPUT, TARGET_RETRY, TARGET_WEBSOCKET, _decode_chunked, analyze_codex_rows, evaluate_tun, read_codex_activity, read_tun_state, resolve_proxy_state  # noqa: E402
 
 TURN_A = "01a00000-0000-7000-8000-000000000001"
 TURN_B = "01a00000-0000-7000-8000-000000000002"
@@ -39,6 +39,25 @@ class DiagnosticsTests(unittest.TestCase):
         )
         self.assertFalse(result["active"])
         self.assertIsNone(result["first_output_median_seconds"])
+
+    def test_current_client_target_is_recognized(self):
+        now = 1_800_000_000.0
+        result = analyze_codex_rows([
+            (int(now - 10), 0, TARGET_CLIENT, "TRACE", TURN_A, "gpt-5.6-sol", "medium"),
+            (int(now - 7), 0, TARGET_OUTPUT, "DEBUG", TURN_A, None, None),
+        ], now)
+        self.assertTrue(result["active"])
+        self.assertEqual(result["first_output_median_seconds"], 3.0)
+
+    def test_recent_output_keeps_long_turn_active(self):
+        now = 1_800_000_000.0
+        result = analyze_codex_rows([
+            (int(now - 600), 0, TARGET_CLIENT, "TRACE", TURN_A, "gpt-5.6-sol", "medium"),
+            (int(now - 10), 0, TARGET_OUTPUT, "DEBUG", TURN_A, None, None),
+        ], now)
+        self.assertTrue(result["active"])
+        self.assertEqual(result["turn_count"], 1)
+        self.assertEqual(result["sample_count"], 0)
 
     def test_schema_error_degrades(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -77,7 +96,7 @@ class DiagnosticsTests(unittest.TestCase):
             connection.executemany(
                 "INSERT INTO logs(ts, ts_nanos, level, target, feedback_log_body) VALUES(?,?,?,?,?)",
                 [
-                    (now - 10, 0, "INFO", TARGET_WEBSOCKET, start),
+                    (now - 10, 0, "TRACE", TARGET_CLIENT, start),
                     (now - 7, 0, "DEBUG", TARGET_OUTPUT, output),
                 ],
             )

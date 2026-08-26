@@ -26,6 +26,8 @@ ACTIVITY_SECONDS = 300
 MAX_ROWS = 20_000
 
 TARGET_WEBSOCKET = "codex_api::endpoint::responses_websocket"
+TARGET_CLIENT = "codex_core::client"
+TARGET_STARTS = frozenset((TARGET_WEBSOCKET, TARGET_CLIENT))
 TARGET_OUTPUT = "codex_core::stream_events_utils"
 TARGET_RETRY = "codex_core::responses_retry"
 
@@ -55,6 +57,7 @@ def analyze_codex_rows(
     cutoff = now - ACTIVITY_SECONDS
     starts: dict[str, TurnStart] = {}
     first_outputs: dict[str, float] = {}
+    last_outputs: dict[str, float] = {}
     retries: dict[str, int] = {}
 
     for seconds, nanos, target, level, turn_id, model, effort in rows:
@@ -62,18 +65,26 @@ def analyze_codex_rows(
             continue
         at = _timestamp(seconds, nanos)
 
-        if target == TARGET_WEBSOCKET:
+        if target in TARGET_STARTS:
             previous = starts.get(turn_id)
             if previous is None or at < previous.at:
                 starts[turn_id] = TurnStart(at=at, model=model, reasoning_effort=effort)
         elif target == TARGET_OUTPUT and level == "DEBUG":
             first_outputs[turn_id] = min(first_outputs.get(turn_id, at), at)
+            last_outputs[turn_id] = max(last_outputs.get(turn_id, at), at)
         elif target == TARGET_RETRY:
             retries[turn_id] = retries.get(turn_id, 0) + 1
 
-    recent = {turn_id: start for turn_id, start in starts.items() if start.at >= cutoff}
+    active_ids = {
+        turn_id for turn_id, start in starts.items() if start.at >= cutoff
+    } | {
+        turn_id for turn_id, output_at in last_outputs.items() if output_at >= cutoff
+    }
     waits: list[float] = []
-    for turn_id, start in recent.items():
+    for turn_id in active_ids:
+        start = starts.get(turn_id)
+        if start is None:
+            continue
         output_at = first_outputs.get(turn_id)
         if output_at is None:
             continue
@@ -81,13 +92,14 @@ def analyze_codex_rows(
         if 0 <= wait <= ACTIVITY_SECONDS:
             waits.append(wait)
 
-    latest = max(recent.values(), key=lambda item: item.at) if recent else None
-    retry_count = sum(retries.get(turn_id, 0) for turn_id in recent)
+    active_starts = [starts[turn_id] for turn_id in active_ids if turn_id in starts]
+    latest = max(active_starts, key=lambda item: item.at) if active_starts else None
+    retry_count = sum(retries.get(turn_id, 0) for turn_id in active_ids)
     return {
         "available": True,
-        "active": bool(recent),
+        "active": bool(active_ids),
         "window_seconds": ACTIVITY_SECONDS,
-        "turn_count": len(recent),
+        "turn_count": len(active_ids),
         "sample_count": len(waits),
         "first_output_median_seconds": round(statistics.median(waits), 3) if waits else None,
         "first_output_p90_seconds": round(_percentile(waits, 0.9), 3) if waits else None,
@@ -115,14 +127,14 @@ def read_codex_activity(path: str = LOG_PATH, now: float | None = None) -> dict[
               + length('run_sampling_request{turn_id='),
             36
           ) AS turn_id,
-          CASE WHEN target = ? THEN
+          CASE WHEN target IN (?, ?) THEN
             substr(
               feedback_log_body,
               instr(feedback_log_body, ' model=') + length(' model='),
               instr(substr(feedback_log_body, instr(feedback_log_body, ' model=') + length(' model=')), ' ') - 1
             )
           END AS model,
-          CASE WHEN target = ? THEN
+          CASE WHEN target IN (?, ?) THEN
             substr(
               feedback_log_body,
               instr(feedback_log_body, 'codex.turn.reasoning_effort=')
@@ -137,7 +149,7 @@ def read_codex_activity(path: str = LOG_PATH, now: float | None = None) -> dict[
         FROM logs INDEXED BY idx_logs_ts
         WHERE ts >= ?
           AND (
-            (target = ? AND instr(feedback_log_body, 'run_sampling_request{turn_id=') > 0)
+            (target IN (?, ?) AND instr(feedback_log_body, 'run_sampling_request{turn_id=') > 0)
             OR
             (target = ? AND level = 'DEBUG'
              AND instr(feedback_log_body, 'Output item item_type=') > 0)
@@ -157,9 +169,12 @@ def read_codex_activity(path: str = LOG_PATH, now: float | None = None) -> dict[
                 query,
                 (
                     TARGET_WEBSOCKET,
+                    TARGET_CLIENT,
                     TARGET_WEBSOCKET,
+                    TARGET_CLIENT,
                     cutoff,
                     TARGET_WEBSOCKET,
+                    TARGET_CLIENT,
                     TARGET_OUTPUT,
                     TARGET_RETRY,
                     MAX_ROWS,

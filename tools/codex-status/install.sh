@@ -53,7 +53,9 @@ codesign --force --sign - "$BUILD_APP" >/dev/null
 codesign --verify --deep --strict "$BUILD_APP"
 
 if [[ "${CODEX_STATUS_SKIP_STOP:-0}" != "1" ]]; then
-  pkill -x AIQuota 2>/dev/null || true
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+  done < <(pgrep -f -x "$EXECUTABLE" 2>/dev/null || true)
 fi
 if [[ -d "$APP_DIR" ]]; then
   mkdir -p "$USER_HOME/.Trash"

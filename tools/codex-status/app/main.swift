@@ -271,8 +271,13 @@ final class NetworkHistory {
             .compactMap(\.latencyMs)
             .sorted()
         let baseline = percentile(baselineValues, 0.5)
-        let slowByBaseline = baselineValues.count >= 5 && median.map { $0 > max(800, baseline! * 2.5) } == true
-        let isSlow = failurePct >= 20 || median.map { $0 > 2000 } == true || jitter.map { $0 > 2000 } == true || slowByBaseline
+        let successCount = successes.count
+        let slowByAbsolute = successCount >= 2 && median.map { $0 > 2000 } == true
+        let slowByFailure = recent.count >= 3 && failurePct >= 20
+        let slowByJitter = successCount >= 3 && jitter.map { $0 > 2000 } == true
+        let slowByBaseline = baselineValues.count >= 5 && successCount >= 2
+            && median.map { $0 > max(800, baseline! * 2.5) } == true
+        let isSlow = slowByFailure || slowByAbsolute || slowByJitter || slowByBaseline
         let isHealthy = recent.count >= 2 && failurePct == 0 && median.map { $0 < 1000 } == true && jitter.map { $0 < 1000 } == true
         return NetworkHealth(
             medianMs: median.map { Int($0.rounded()) },
@@ -573,7 +578,9 @@ class CardView: NSView {
             return ("无法确定", "等待网络样本 · 低可信度", orangeColor)
         }
         if n.isSlow {
-            let confidence = (n.failurePct >= 20 || (n.medianMs ?? 0) > 2000) ? "高" : "中"
+            let severe = n.failurePct >= 40 || (n.medianMs ?? 0) > 4000
+                || (n.jitterMs ?? 0) > 4000
+            let confidence = n.sampleCount >= 4 && severe ? "高" : "中"
             return ("网络慢", "延迟、失败或抖动异常 · \(confidence)可信度", redColor)
         }
         guard let codex = diagnostics?.codex, codex.available else {
@@ -656,6 +663,20 @@ class CardView: NSView {
         return "\(Int(milliseconds.rounded())) ms"
     }
 
+    private func drawMidScaleLabel(_ text: String, in chartRect: NSRect) {
+        let label = attrString(text, size: 8, weight: .medium,
+                               color: NSColor(white: 1, alpha: 0.52))
+        let size = label.size()
+        let box = NSRect(x: chartRect.minX + 4,
+                         y: chartRect.midY - size.height - 2,
+                         width: size.width + 6,
+                         height: size.height + 2)
+        let background = NSBezierPath(roundedRect: box, xRadius: 3, yRadius: 3)
+        NSColor(srgbRed: 0.086, green: 0.094, blue: 0.118, alpha: 0.78).setFill()
+        background.fill()
+        label.draw(at: NSPoint(x: box.minX + 3, y: box.minY + 1))
+    }
+
     private func drawLatencyChart(at y: CGFloat, width: CGFloat) {
         let chartTop = y + 19
         let chartRect = NSRect(x: padX, y: chartTop, width: width, height: 44)
@@ -676,7 +697,7 @@ class CardView: NSView {
         frame.lineWidth = 1
         frame.stroke()
 
-        for fraction in [CGFloat(1.0 / 3.0), CGFloat(2.0 / 3.0)] {
+        for fraction in [CGFloat(0.25), CGFloat(0.5), CGFloat(0.75)] {
             let grid = NSBezierPath()
             let gridY = chartRect.minY + chartRect.height * fraction
             grid.move(to: NSPoint(x: chartRect.minX, y: gridY))
@@ -690,6 +711,7 @@ class CardView: NSView {
             let waiting = attrString("等待网络样本", size: 9, color: dimColor)
             waiting.draw(at: NSPoint(x: chartRect.midX - waiting.size().width / 2,
                                      y: chartRect.midY - waiting.size().height / 2))
+            drawMidScaleLabel(fmtLatencyScale(ceiling / 2), in: chartRect)
             return
         }
 
@@ -740,6 +762,7 @@ class CardView: NSView {
             previous = (sample, current)
         }
         NSGraphicsContext.restoreGraphicsState()
+        drawMidScaleLabel(fmtLatencyScale(ceiling / 2), in: chartRect)
     }
 
     private func drawNetworkChart(at y: CGFloat, width: CGFloat) {
@@ -765,7 +788,7 @@ class CardView: NSView {
         frame.lineWidth = 1
         frame.stroke()
 
-        for fraction in [CGFloat(1.0 / 3.0), CGFloat(2.0 / 3.0)] {
+        for fraction in [CGFloat(0.25), CGFloat(0.5), CGFloat(0.75)] {
             let grid = NSBezierPath()
             let gridY = chartRect.minY + chartRect.height * fraction
             grid.move(to: NSPoint(x: chartRect.minX, y: gridY))
@@ -775,7 +798,10 @@ class CardView: NSView {
             grid.stroke()
         }
 
-        guard networkRateSamples.count > 1 else { return }
+        guard networkRateSamples.count > 1 else {
+            drawMidScaleLabel(fmtRate(ceiling / 2), in: chartRect)
+            return
+        }
         let stepX = chartRect.width / CGFloat(networkSampleLimit - 1)
         let startX = chartRect.maxX - CGFloat(networkRateSamples.count - 1) * stepX
 
@@ -812,6 +838,7 @@ class CardView: NSView {
         drawSeries(points(for: { $0.down }), color: downColor)
         drawSeries(points(for: { $0.up }), color: upColor)
         NSGraphicsContext.restoreGraphicsState()
+        drawMidScaleLabel(fmtRate(ceiling / 2), in: chartRect)
     }
 
     private func itemHeight(_ item: Item) -> CGFloat {
@@ -1089,9 +1116,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
            let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let mode = cfg["anchor_screen"] as? String, mode == "mouse" {
             let m = NSEvent.mouseLocation
-            return NSScreen.screens.first { NSMouseInRect(m, $0.frame, false) } ?? NSScreen.screens.first
+            return NSScreen.screens.first { NSMouseInRect(m, $0.frame, false) }
+                ?? NSScreen.main ?? NSScreen.screens.first
         }
-        return NSScreen.screens.first ?? NSScreen.main
+        return NSScreen.main ?? NSScreen.screens.first
     }
 
     /// 锚在所选屏幕可视区左上角
