@@ -49,9 +49,33 @@ struct CodexActivity: Codable {
     let first_output_median_seconds: Double?
     let first_output_p90_seconds: Double?
     let retry_count: Int?
+    let retry_turn_count: Int?
+    let first_attempt_success_pct: Int?
+    let max_retries_per_turn: Int?
+    let opening_retry_count: Int?
+    let tls_eof_count: Int?
+    let connection_closed_count: Int?
+    let stable_streak: Int?
     let model: String?
     let reasoning_effort: String?
     let error: String?
+}
+
+struct GPTNodeQuality: Codable {
+    let node: String?
+    let status: String
+    let confidence: String?
+    let turn_count: Int?
+    let required_turn_count: Int?
+    let first_attempt_success_pct: Int?
+    let retry_turn_count: Int?
+    let retry_count: Int?
+    let max_retries_per_turn: Int?
+    let opening_retry_count: Int?
+    let tls_eof_count: Int?
+    let connection_closed_count: Int?
+    let hard_failure_count: Int?
+    let stable_streak: Int?
 }
 
 struct DiagnosticsData: Codable {
@@ -59,15 +83,19 @@ struct DiagnosticsData: Codable {
     let tun: TunStateData
     let proxy: ProxyStateData?
     let codex: CodexActivity
+    let gpt_quality: GPTNodeQuality?
 }
 
 struct GPTNodeResult: Codable {
     let name: String
     let median_ms: Int?
+    let p90_ms: Int?
     let min_ms: Int?
     let max_ms: Int?
     let success_count: Int?
     let sample_count: Int?
+    let success_pct: Int?
+    let quality: GPTNodeQuality?
 }
 
 struct GPTNodeBenchmark: Codable {
@@ -76,7 +104,10 @@ struct GPTNodeBenchmark: Codable {
     let current_name: String?
     let current: GPTNodeResult?
     let recommended: GPTNodeResult?
+    let trial: GPTNodeResult?
     let best: GPTNodeResult?
+    let current_quality: GPTNodeQuality?
+    let recommendation_kind: String?
     let error: String?
 }
 
@@ -548,14 +579,13 @@ class CardView: NSView {
     enum Item {
         case header
         case divider
-        case title(String, String?, Bool)   // 标题, 套餐名, 是否缓存
+        case title(String, Bool)            // 标题, 是否缓存
         case win(QuotaWindow)
         case error(String)
         case metric(String, String, NSColor) // 名称, 值, 状态色
-        case recommendation(String, String, Bool) // 节点, GPT 延迟/状态, 是否可切换
+        case summary(String, String, NSColor, String?, NSColor?) // 名称, 主摘要, 主色, 次摘要, 次色
+        case recommendation(String, String, String, String?) // 标签, 节点, 状态, 按钮标题
         case latencyChart                    // 连接诊断：ChatGPT 延迟趋势
-        case diagnosis(String, String, NSColor)
-        case sysBar(String, String, Int)    // 名称, 说明, 百分比（带进度条）
         case sysNet(String)                 // 右侧"↓ ↓"速度文本
         case netChart                       // 系统区：下载/上传趋势
     }
@@ -571,7 +601,7 @@ class CardView: NSView {
                 items.append(.error("未检测到 Codex；登录后显示额度"))
                 continue
             }
-            items.append(.title(label, side.level, side.stale ?? false))
+            items.append(.title(label, side.stale ?? false))
             if side.ok {
                 items.append(contentsOf: (side.windows ?? []).map { .win($0) })
             } else {
@@ -583,36 +613,36 @@ class CardView: NSView {
 
     private func diagnosticItems() -> [Item] {
         let tun = diagnostics?.tun
-        let tunValue: String
+        let tunSummary: String
         let tunColor: NSColor
         switch tun?.state {
         case "enabled":
-            tunValue = tun?.detail ?? "已开启"
+            tunSummary = " · TUN 正常"
             tunColor = greenColor
         case "disabled":
-            tunValue = "未开启"
+            tunSummary = " · TUN 未开启"
             tunColor = redColor
         default:
-            tunValue = tun?.detail ?? "检测中…"
+            tunSummary = " · TUN 检测中"
             tunColor = orangeColor
         }
 
-        let networkValue: String
+        let networkSummary: String
         let networkColor: NSColor
         if let n = network, let median = n.medianMs {
             if n.failurePct > 0 {
-                networkValue = "\(median) ms · 失败\(n.failurePct)%"
-            } else if let jitter = n.jitterMs, jitter >= 1000 {
-                networkValue = "\(median) ms · 抖动\(jitter)"
+                networkSummary = " · 失败 \(n.failurePct)%"
+            } else if let jitter = n.jitterMs {
+                networkSummary = " · P90 \(median + jitter) ms"
             } else {
-                networkValue = "\(median) ms · \(n.sampleCount)样本"
+                networkSummary = " · P90 \(median) ms"
             }
             networkColor = n.isSlow ? redColor : (n.isHealthy ? greenColor : orangeColor)
         } else if let current = gptNodes?.current, let latency = current.median_ms {
-            networkValue = "\(latency) ms · \(current.success_count ?? 0)样本"
+            networkSummary = " · P90 \(current.p90_ms ?? latency) ms"
             networkColor = latency < 1000 ? greenColor : (latency < 2000 ? orangeColor : redColor)
         } else {
-            networkValue = "检测中…"
+            networkSummary = " · 测速中"
             networkColor = dimColor
         }
 
@@ -634,6 +664,24 @@ class CardView: NSView {
             proxyColor = orangeColor
         }
 
+        let quality = diagnostics?.gpt_quality ?? gptNodes?.current_quality
+        let qualityValue: String
+        let qualityColor: NSColor
+        switch quality?.status {
+        case "stable":
+            qualityValue = "稳定 \(quality?.stable_streak ?? 0)轮"
+            qualityColor = greenColor
+        case "unstable":
+            qualityValue = "不稳定 · 重连 \(quality?.retry_count ?? 0)次"
+            qualityColor = redColor
+        case "unavailable":
+            qualityValue = "不可用"
+            qualityColor = redColor
+        default:
+            qualityValue = "观察中 \(quality?.turn_count ?? 0)/\(quality?.required_turn_count ?? 10)"
+            qualityColor = orangeColor
+        }
+
         let codex = diagnostics?.codex
         let codexValue: String
         let codexColor: NSColor
@@ -647,61 +695,76 @@ class CardView: NSView {
             codexValue = "空闲"
             codexColor = faintColor
         } else if let wait = codex?.first_output_median_seconds {
-            let model = shortModel(codex?.model)
-            let effort = codex?.reasoning_effort ?? "?"
-            codexValue = String(format: "%.1f s · %@/%@", wait, model, effort)
+            codexValue = String(format: "首输出 %.1f s", wait)
             codexColor = wait > slowThreshold(effort: codex?.reasoning_effort) ? orangeColor : greenColor
         } else {
-            codexValue = "活动中 · 等待首输出"
+            codexValue = "等待首输出"
             codexColor = orangeColor
         }
 
-        let recommendation: Item
+        var recommendation: Item?
+        let currentStatus = quality?.status ?? "observing"
         if let status = switchStatus {
             recommendation = .recommendation(
-                gptNodes?.recommended?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? "建议节点",
+                "建议",
+                (gptNodes?.recommended ?? gptNodes?.trial)?.name
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? "建议节点",
                 status,
-                false
+                nil
             )
-        } else if let nodes = gptNodes, nodes.available {
-            if let suggested = nodes.recommended, let latency = suggested.median_ms {
+        } else if ["unstable", "unavailable"].contains(currentStatus),
+                  let nodes = gptNodes, nodes.available {
+            if let suggested = nodes.recommended {
+                let stable = suggested.quality
                 recommendation = .recommendation(
+                    "建议切换",
                     suggested.name.trimmingCharacters(in: .whitespacesAndNewlines),
-                    String(format: "GPT %d ms · %d样本", latency, suggested.success_count ?? 0),
-                    true
+                    "首连 \(stable?.first_attempt_success_pct ?? 0)% · \(stable?.turn_count ?? 0)轮验证",
+                    "切换"
                 )
-            } else if let current = nodes.current, let latency = current.median_ms {
+            } else if let trial = nodes.trial {
                 recommendation = .recommendation(
-                    "当前节点已较优",
-                    String(format: "GPT %d ms", latency),
-                    false
+                    "候选试用",
+                    trial.name.trimmingCharacters(in: .whitespacesAndNewlines),
+                    "短测 P90 \(trial.p90_ms ?? trial.median_ms ?? 0) ms · 稳定性未验证",
+                    "试用"
                 )
             } else {
-                recommendation = .recommendation("暂无建议", "GPT 节点测速无有效样本", false)
+                recommendation = .summary("建议", "暂无稳定候选", faintColor, nil, nil)
             }
-        } else if let error = gptNodes?.error {
-            recommendation = .recommendation("测速不可用", error, false)
-        } else {
-            recommendation = .recommendation("正在比较节点…", "仅测试 GPT 连接，不切换", false)
+        } else if ["unstable", "unavailable"].contains(currentStatus) {
+            recommendation = .summary("建议", "暂无稳定候选", faintColor, nil, nil)
         }
+
+        let diagnosisResult = diagnosis()
+        let confidence = confidenceSummary(from: diagnosisResult.detail)
+        let codexSummary: String
+        if ["连接不稳定", "网络慢", "模型/推理慢"].contains(diagnosisResult.title) {
+            codexSummary = diagnosisResult.title
+        } else {
+            codexSummary = codexValue
+        }
+        let codexSummaryColor = ["连接不稳定", "网络慢"].contains(codexSummary)
+            ? redColor
+            : (["模型/推理慢"].contains(codexSummary) ? orangeColor : codexColor)
 
         var items: [Item] = [
             .divider,
-            .title("连接诊断", nil, false),
-            .metric("TUN", tunValue, tunColor),
-            .metric("当前节点", proxyValue, proxyColor),
-            .metric("GPT 连接", networkValue, networkColor),
-            recommendation,
+            .summary("节点", proxyValue, proxyColor, tunSummary, tunColor),
+            .summary("GPT", qualityValue, qualityColor, networkSummary, networkColor),
             .latencyChart,
+            .summary("Codex", codexSummary, codexSummaryColor, " · \(confidence)", diagnosisResult.color),
         ]
-        if codex?.available == false {
-            items.append(.diagnosis("仅网络监测", "未检测到 Codex", faintColor))
-        } else {
-            let result = diagnosis()
-            items.append(.metric("Codex", codexValue, codexColor))
-            items.append(.diagnosis(result.title, result.detail, result.color))
+        if let recommendation {
+            items.insert(recommendation, at: 3)
         }
         return items
+    }
+
+    private func confidenceSummary(from detail: String) -> String {
+        if detail.contains("高可信度") { return "高可信度" }
+        if detail.contains("中可信度") { return "中可信度" }
+        return "低可信度"
     }
 
     private func shortModel(_ model: String?) -> String {
@@ -720,6 +783,10 @@ class CardView: NSView {
     }
 
     private func diagnosis() -> (title: String, detail: String, color: NSColor) {
+        if diagnostics?.gpt_quality?.status == "unstable" {
+            let reconnects = diagnostics?.gpt_quality?.retry_count ?? 0
+            return ("连接不稳定", "真实对话检测到 \(reconnects) 次流重连 · 高可信度", redColor)
+        }
         guard let n = network, n.sampleCount > 0 else {
             return ("无法确定", "等待网络样本 · 低可信度", orangeColor)
         }
@@ -736,7 +803,7 @@ class CardView: NSView {
             return ("Codex 空闲", n.isHealthy ? "当前网络正常" : "网络样本仍在收集", faintColor)
         }
         if (codex.retry_count ?? 0) > 0 {
-            return ("无法确定", "检测到 \(codex.retry_count ?? 0) 次流重连 · 中可信度", orangeColor)
+            return ("连接不稳定", "检测到 \(codex.retry_count ?? 0) 次流重连 · 中可信度", redColor)
         }
         guard let wait = codex.first_output_median_seconds else {
             return ("无法确定", "任务尚未产生首输出样本 · 低可信度", orangeColor)
@@ -754,9 +821,13 @@ class CardView: NSView {
         let memPct = s.memTotal > 0 ? min(100, Int(Double(s.memUsed) / Double(s.memTotal) * 100)) : 0
         return [
             .divider,
-            .title("系统", nil, false),
-            .sysBar("CPU", "\(ProcessInfo.processInfo.activeProcessorCount) 核", s.cpuPct),
-            .sysBar("内存", "\(fmtGB(s.memUsed))/\(fmtGB(s.memTotal))", memPct),
+            .summary(
+                "系统",
+                "CPU \(s.cpuPct)%",
+                colorFor(usage: s.cpuPct),
+                " · 内存 \(memPct)%",
+                colorFor(usage: memPct)
+            ),
             .sysNet("↓ \(fmtRate(s.downBps))  ↑ \(fmtRate(s.upBps))"),
             .netChart,
         ]
@@ -1001,10 +1072,9 @@ class CardView: NSView {
         case .win: return 34
         case .error: return 22
         case .metric: return 24
+        case .summary: return 24
         case .recommendation: return 40
         case .latencyChart: return 71
-        case .diagnosis: return 36
-        case .sysBar: return 34
         case .sysNet: return 23
         case .netChart: return 75
         }
@@ -1066,23 +1136,15 @@ class CardView: NSView {
                 line.stroke()
                 y += itemHeight(item)
 
-            case .title(let label, let level, let stale):
+            case .title(let label, let stale):
                 attrString(label, size: 13, weight: .semibold, color: faintColor)
                     .draw(at: NSPoint(x: padX, y: y + 3))
-                var bx = padX + attrString(label, size: 13, weight: .semibold, color: faintColor).size().width + 8
-                if let level = level, !level.isEmpty {
-                    let name = ["pro": "Pro", "lite": "Lite", "prolite": "Pro Lite", "max": "Max"][level] ?? level
-                    let badge = attrString(name, size: 11, color: NSColor(white: 1, alpha: 0.72))
-                    let bsz = badge.size()
-                    let rect = NSRect(x: bx, y: y - 1, width: bsz.width + 14, height: bsz.height + 5)
-                    let pill = NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5)
-                    NSColor(white: 1, alpha: 0.12).setFill()
-                    pill.fill()
-                    badge.draw(at: NSPoint(x: bx + 7, y: y + 1.5))
-                    bx = rect.maxX + 6
-                }
                 if stale {
-                    attrString("缓存", size: 10, color: orangeColor).draw(at: NSPoint(x: bx, y: y + 4))
+                    let cache = attrString("缓存", size: 10, color: orangeColor)
+                    cache.draw(at: NSPoint(
+                        x: padX + attrString(label, size: 13, weight: .semibold, color: faintColor).size().width + 8,
+                        y: y + 4
+                    ))
                 }
                 y += itemHeight(item)
 
@@ -1133,9 +1195,30 @@ class CardView: NSView {
                 t.draw(at: NSPoint(x: cardWidth - padX - size.width, y: y + 4))
                 y += itemHeight(item)
 
-            case .recommendation(let name, let detail, let canSwitch):
-                attrString("建议切换", size: 12, color: faintColor)
+            case .summary(let label, let primary, let primaryColor, let secondary, let secondaryColor):
+                attrString(label, size: 12, color: faintColor).draw(at: NSPoint(x: padX, y: y + 4))
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.alignment = .right
+                paragraph.lineBreakMode = .byTruncatingTail
+                let value = NSMutableAttributedString(string: primary, attributes: [
+                    .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+                    .foregroundColor: primaryColor,
+                    .paragraphStyle: paragraph,
+                ])
+                if let secondary, !secondary.isEmpty {
+                    value.append(NSAttributedString(string: secondary, attributes: [
+                        .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+                        .foregroundColor: secondaryColor ?? dimColor,
+                        .paragraphStyle: paragraph,
+                    ]))
+                }
+                value.draw(in: NSRect(x: padX + 54, y: y + 3, width: contentW - 54, height: 18))
+                y += itemHeight(item)
+
+            case .recommendation(let label, let name, let detail, let actionTitle):
+                attrString(label, size: 12, color: faintColor)
                     .draw(at: NSPoint(x: padX, y: y + 3))
+                let canSwitch = actionTitle != nil
                 let buttonWidth: CGFloat = canSwitch ? 48 : 0
                 let valueX = padX + 64
                 let valueWidth = contentW - 64 - (canSwitch ? buttonWidth + 8 : 0)
@@ -1153,7 +1236,11 @@ class CardView: NSView {
                     .paragraphStyle: paragraph,
                 ])
                 detailText.draw(in: NSRect(x: valueX, y: y + 20, width: valueWidth, height: 15))
-                if canSwitch {
+                if let actionTitle {
+                    switchButton.title = actionTitle
+                    switchButton.toolTip = actionTitle == "试用"
+                        ? "切换到候选节点并开始真实稳定性观察"
+                        : "切换到已验证稳定节点，并重新测试 GPT 连接"
                     let rect = NSRect(
                         x: cardWidth - padX - buttonWidth,
                         y: y + 5,
@@ -1170,37 +1257,6 @@ class CardView: NSView {
                 drawLatencyChart(at: y, width: contentW)
                 y += itemHeight(item)
 
-            case .diagnosis(let title, let detail, let color):
-                attrString(title, size: 13, weight: .semibold, color: color)
-                    .draw(at: NSPoint(x: padX, y: y + 2))
-                let t = attrString(detail, size: 10, color: dimColor)
-                let size = t.size()
-                t.draw(at: NSPoint(x: cardWidth - padX - size.width, y: y + 4))
-                y += itemHeight(item)
-
-            case .sysBar(let label, let mid, let pct):
-                let c = colorFor(usage: pct)
-                attrString(label, size: 12, color: faintColor).draw(at: NSPoint(x: padX, y: y + 3))
-                if !mid.isEmpty {
-                    attrString(mid, size: 11, color: dimColor).draw(at: NSPoint(x: padX + 34, y: y + 4))
-                }
-                let p = attrString("\(pct)%", size: 13, weight: .semibold, color: c)
-                let psz = p.size()
-                p.draw(at: NSPoint(x: cardWidth - padX - psz.width, y: y + 1))
-                y += 19
-                let track = NSBezierPath(roundedRect: NSRect(x: padX, y: y, width: contentW, height: 6),
-                                         xRadius: 3, yRadius: 3)
-                NSColor(white: 1, alpha: 0.12).setFill()
-                track.fill()
-                let fw = contentW * CGFloat(min(100, max(0, pct))) / 100
-                if fw > 0 {
-                    let fill = NSBezierPath(roundedRect: NSRect(x: padX, y: y, width: fw, height: 6),
-                                            xRadius: 3, yRadius: 3)
-                    c.setFill()
-                    fill.fill()
-                }
-                y += 15
-
             case .sysNet(let text):
                 attrString("网络", size: 12, color: faintColor).draw(at: NSPoint(x: padX, y: y + 4))
                 let t = attrString(text, size: 12, weight: .medium, color: textColor)
@@ -1216,7 +1272,7 @@ class CardView: NSView {
     }
 
     @objc private func handleSwitchButton() {
-        guard let target = gptNodes?.recommended?.name else { return }
+        guard let target = (gptNodes?.recommended ?? gptNodes?.trial)?.name else { return }
         onSwitchRecommended?(target)
     }
 }

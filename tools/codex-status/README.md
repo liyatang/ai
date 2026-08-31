@@ -6,7 +6,8 @@
 
 - Codex 周额度和重置时间
 - Clash/mihomo TUN 是否真正生效、当前 AI 代理节点
-- 当前节点连接 GPT 的实际端点延迟、排除香港后的推荐节点和手动切换按钮
+- 当前节点的真实 GPT 首连成功率、流重连、连续稳定轮数和轻量端点 P50/P90
+- 仅在当前连接不稳定时给出已验证稳定节点建议；未验证节点只提供手动“试用”
 - ChatGPT 网络延迟、Codex 最近五分钟首输出等待和保守诊断
 - CPU、内存、实时上下行网速
 - 连接诊断中的 ChatGPT 延迟图，以及系统区的网络速度滚动图（最近三分钟）
@@ -45,11 +46,12 @@ cd ai/tools/codex-status
 - 不上传、不提交或显示 Codex token
 - 不读取提示词、工具参数和工作目录
 - Codex 性能诊断只读取本机日志中的时间、模型、reasoning effort、事件类型和重试元数据
-- 节点测速通过 mihomo 让候选节点分别访问 ChatGPT 轻量端点；测速不切换节点、不调用模型，只有点击按钮才切换
+- 节点稳定性历史保存在 `~/.config/quota-widget/gpt_node_quality.json`，仅包含最近 24 小时、至多 20 轮的聚合性能元数据，权限为 `0600`
+- 节点测速通过 mihomo 让候选节点分别访问 ChatGPT 轻量端点；测速不切换节点、不调用模型，只有点击“切换”或“试用”才切换
 - 配置保存在 `~/.config/quota-widget/config.json`，权限设置为 `0600`
 - 额度请求使用当前用户自己的 Codex 登录态
 
-不要把 `~/.codex/auth.json`、`config.json`、`cache.json` 或 Codex 日志提交到仓库。
+不要把 `~/.codex/auth.json`、`config.json`、`cache.json`、`gpt_node_quality.json` 或 Codex 日志提交到仓库。
 
 ## 首次打开与开机启动
 

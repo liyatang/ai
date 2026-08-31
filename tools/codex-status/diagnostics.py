@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -23,6 +25,7 @@ from typing import Any
 
 
 LOG_PATH = os.path.expanduser("~/.codex/logs_2.sqlite")
+QUALITY_PATH = os.path.expanduser("~/.config/quota-widget/gpt_node_quality.json")
 MIHOMO_SOCKET = "/tmp/verge/verge-mihomo.sock"
 CLASH_APP_PATHS = (
     "/Applications/Clash Verge.app",
@@ -33,9 +36,13 @@ CLASH_APP_PATHS = (
 ACTIVITY_SECONDS = 300
 MAX_ROWS = 20_000
 GPT_PROBE_URL = "https://chatgpt.com/cdn-cgi/trace"
-GPT_PROBE_ROUNDS = 3
+GPT_PROBE_ROUNDS = 5
 GPT_PROBE_TIMEOUT_MS = 6_000
 GROUP_PROXY_TYPES = frozenset(("Selector", "URLTest", "Fallback", "LoadBalance"))
+QUALITY_WINDOW_SECONDS = 86_400
+QUALITY_MAX_TURNS = 20
+QUALITY_MIN_STABLE_TURNS = 10
+SWITCH_GRACE_SECONDS = 30
 
 TARGET_WEBSOCKET = "codex_api::endpoint::responses_websocket"
 TARGET_CLIENT = "codex_core::client"
@@ -63,7 +70,7 @@ def _percentile(values: list[float], fraction: float) -> float | None:
 
 
 def analyze_codex_rows(
-    rows: list[tuple[int, int, str, str, str, str | None, str | None]], now: float
+    rows: list[tuple[Any, ...]], now: float
 ) -> dict[str, Any]:
     """把已经过滤为性能元数据的日志行聚合为最近五分钟活动。"""
     cutoff = now - ACTIVITY_SECONDS
@@ -71,8 +78,13 @@ def analyze_codex_rows(
     first_outputs: dict[str, float] = {}
     last_outputs: dict[str, float] = {}
     retries: dict[str, int] = {}
+    retry_times: dict[str, list[float]] = {}
+    tls_eofs: dict[str, int] = {}
+    closed_connections: dict[str, int] = {}
 
-    for seconds, nanos, target, level, turn_id, model, effort in rows:
+    for row in rows:
+        seconds, nanos, target, level, turn_id, model, effort = row[:7]
+        body = str(row[7] or "") if len(row) > 7 else ""
         if not re.fullmatch(r"[0-9a-f-]{36}", turn_id or ""):
             continue
         at = _timestamp(seconds, nanos)
@@ -86,6 +98,11 @@ def analyze_codex_rows(
             last_outputs[turn_id] = max(last_outputs.get(turn_id, at), at)
         elif target == TARGET_RETRY:
             retries[turn_id] = retries.get(turn_id, 0) + 1
+            retry_times.setdefault(turn_id, []).append(at)
+            if "unexpected-eof" in body or "close_notify" in body:
+                tls_eofs[turn_id] = tls_eofs.get(turn_id, 0) + 1
+            if "Connection closed" in body or "connection closed" in body:
+                closed_connections[turn_id] = closed_connections.get(turn_id, 0) + 1
 
     active_ids = {
         turn_id for turn_id, start in starts.items() if start.at >= cutoff
@@ -107,6 +124,48 @@ def analyze_codex_rows(
     active_starts = [starts[turn_id] for turn_id in active_ids if turn_id in starts]
     latest = max(active_starts, key=lambda item: item.at) if active_starts else None
     retry_count = sum(retries.get(turn_id, 0) for turn_id in active_ids)
+    eligible_ids = {
+        turn_id for turn_id in active_ids
+        if turn_id in first_outputs or retries.get(turn_id, 0) > 0
+    }
+    retry_turn_count = sum(1 for turn_id in eligible_ids if retries.get(turn_id, 0) > 0)
+    first_attempt_success_count = sum(
+        1 for turn_id in eligible_ids
+        if turn_id in first_outputs and retries.get(turn_id, 0) == 0
+    )
+    first_attempt_success_pct = (
+        round(first_attempt_success_count / len(eligible_ids) * 100)
+        if eligible_ids else None
+    )
+    ordered_eligible = sorted(
+        eligible_ids,
+        key=lambda turn_id: starts.get(turn_id, TurnStart(0, None, None)).at,
+        reverse=True,
+    )
+    stable_streak = 0
+    for turn_id in ordered_eligible:
+        if turn_id in first_outputs and retries.get(turn_id, 0) == 0:
+            stable_streak += 1
+        else:
+            break
+    turn_records = []
+    for turn_id in active_ids:
+        start = starts.get(turn_id)
+        if start is None:
+            continue
+        turn_retry_times = retry_times.get(turn_id, [])
+        turn_records.append({
+            "turn_id": turn_id,
+            "start_at": round(start.at, 6),
+            "last_seen_at": round(max(
+                [start.at, first_outputs.get(turn_id, start.at), *turn_retry_times]
+            ), 6),
+            "has_output": turn_id in first_outputs,
+            "retry_count": retries.get(turn_id, 0),
+            "opening_retry_count": sum(1 for at in turn_retry_times if at - start.at <= 15),
+            "tls_eof_count": tls_eofs.get(turn_id, 0),
+            "connection_closed_count": closed_connections.get(turn_id, 0),
+        })
     return {
         "available": True,
         "active": bool(active_ids),
@@ -116,8 +175,22 @@ def analyze_codex_rows(
         "first_output_median_seconds": round(statistics.median(waits), 3) if waits else None,
         "first_output_p90_seconds": round(_percentile(waits, 0.9), 3) if waits else None,
         "retry_count": retry_count,
+        "retry_turn_count": retry_turn_count,
+        "first_attempt_success_count": first_attempt_success_count,
+        "first_attempt_success_pct": first_attempt_success_pct,
+        "max_retries_per_turn": max((retries.get(turn_id, 0) for turn_id in eligible_ids), default=0),
+        "opening_retry_count": sum(
+            1 for turn_id in eligible_ids for at in retry_times.get(turn_id, [])
+            if at - starts[turn_id].at <= 15
+        ),
+        "tls_eof_count": sum(tls_eofs.get(turn_id, 0) for turn_id in eligible_ids),
+        "connection_closed_count": sum(
+            closed_connections.get(turn_id, 0) for turn_id in eligible_ids
+        ),
+        "stable_streak": stable_streak,
         "model": latest.model if latest else None,
         "reasoning_effort": latest.reasoning_effort if latest else None,
+        "_turns": turn_records,
     }
 
 
@@ -157,7 +230,8 @@ def read_codex_activity(path: str = LOG_PATH, now: float | None = None) -> dict[
                   + length('codex.turn.reasoning_effort=')
               ), '}') - 1
             )
-          END AS reasoning_effort
+          END AS reasoning_effort,
+          CASE WHEN target = ? THEN feedback_log_body END AS retry_detail
         FROM logs INDEXED BY idx_logs_ts
         WHERE ts >= ?
           AND (
@@ -184,6 +258,7 @@ def read_codex_activity(path: str = LOG_PATH, now: float | None = None) -> dict[
                     TARGET_CLIENT,
                     TARGET_WEBSOCKET,
                     TARGET_CLIENT,
+                    TARGET_RETRY,
                     cutoff,
                     TARGET_WEBSOCKET,
                     TARGET_CLIENT,
@@ -389,21 +464,292 @@ def resolve_gpt_proxy_context(proxies_payload: dict[str, Any]) -> dict[str, Any]
     }
 
 
-def choose_gpt_recommendation(
-    current_name: str | None, node_results: list[dict[str, Any]]
+def load_quality_history(
+    path: str = QUALITY_PATH, now: float | None = None
 ) -> dict[str, Any]:
-    successful = [item for item in node_results if isinstance(item.get("median_ms"), int)]
-    successful.sort(key=lambda item: (item["median_ms"], item.get("max_ms") or 10**9))
+    current = time.time() if now is None else now
+    try:
+        with open(path, encoding="utf-8") as file:
+            payload = json.load(file)
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            raise ValueError("unsupported quality history")
+        payload.setdefault("created_at", current)
+        payload.setdefault("turns", {})
+        payload.setdefault("switches", [])
+        return payload
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {
+            "version": 1,
+            "created_at": current,
+            "updated": current,
+            "turns": {},
+            "switches": [],
+        }
+
+
+@contextlib.contextmanager
+def quality_history_lock(path: str = QUALITY_PATH):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    descriptor = os.open(f"{path}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def save_quality_history(history: dict[str, Any], path: str = QUALITY_PATH) -> None:
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    temporary = f"{path}.tmp-{os.getpid()}"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            json.dump(history, file, ensure_ascii=False, separators=(",", ":"))
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def record_node_switch(
+    previous: str | None,
+    target: str,
+    at: float | None = None,
+    path: str = QUALITY_PATH,
+) -> None:
+    changed_at = time.time() if at is None else at
+    with quality_history_lock(path):
+        history = load_quality_history(path, changed_at)
+        history["switches"] = [
+            item for item in history.get("switches", [])
+            if changed_at - float(item.get("at") or 0) <= QUALITY_WINDOW_SECONDS
+        ]
+        history["switches"].append({"at": changed_at, "from": previous, "to": target})
+        history["updated"] = changed_at
+        save_quality_history(history, path)
+
+
+def _node_for_turn(
+    start_at: float, current_name: str, switches: list[dict[str, Any]]
+) -> str:
+    ordered = sorted(switches, key=lambda item: float(item.get("at") or 0))
+    node = current_name
+    for item in ordered:
+        switched_at = float(item.get("at") or 0)
+        if start_at < switched_at:
+            previous = item.get("from")
+            return str(previous) if previous else node
+        target = item.get("to")
+        if target:
+            node = str(target)
+    return node
+
+
+def update_quality_history(
+    history: dict[str, Any],
+    current_name: str | None,
+    turns: list[dict[str, Any]],
+    now: float,
+) -> dict[str, Any]:
+    cutoff = now - QUALITY_WINDOW_SECONDS
+    created_at = float(history.get("created_at") or now)
+    switches = [
+        item for item in history.get("switches", [])
+        if float(item.get("at") or 0) >= cutoff
+    ]
+    stored = {
+        turn_id: item for turn_id, item in (history.get("turns") or {}).items()
+        if float((item or {}).get("last_seen_at") or 0) >= cutoff
+    }
+    if current_name:
+        for turn in turns:
+            turn_id = str(turn.get("turn_id") or "")
+            start_at = float(turn.get("start_at") or 0)
+            if not turn_id or start_at < created_at or start_at < cutoff:
+                continue
+            previous = stored.get(turn_id) or {}
+            node = str(previous.get("node") or _node_for_turn(start_at, current_name, switches))
+            last_seen_at = float(turn.get("last_seen_at") or start_at)
+            overlaps_switch = any(
+                start_at <= float(item.get("at") or 0) + SWITCH_GRACE_SECONDS
+                and last_seen_at >= float(item.get("at") or 0) - 5
+                for item in switches
+            )
+            stored[turn_id] = {
+                "node": node,
+                "start_at": start_at,
+                "last_seen_at": last_seen_at,
+                "has_output": bool(turn.get("has_output")),
+                "retry_count": int(turn.get("retry_count") or 0),
+                "opening_retry_count": int(turn.get("opening_retry_count") or 0),
+                "tls_eof_count": int(turn.get("tls_eof_count") or 0),
+                "connection_closed_count": int(turn.get("connection_closed_count") or 0),
+                "ignored_after_switch": bool(previous.get("ignored_after_switch")) or overlaps_switch,
+            }
+    history.update({
+        "version": 1,
+        "created_at": created_at,
+        "updated": now,
+        "turns": stored,
+        "switches": switches,
+    })
+    return history
+
+
+def summarize_node_quality(
+    history: dict[str, Any], node: str, now: float | None = None
+) -> dict[str, Any]:
+    current = time.time() if now is None else now
+    records = [
+        item for item in (history.get("turns") or {}).values()
+        if (item or {}).get("node") == node
+        and not (item or {}).get("ignored_after_switch")
+        and current - float((item or {}).get("start_at") or 0) <= QUALITY_WINDOW_SECONDS
+        and (
+            (item or {}).get("has_output")
+            or int((item or {}).get("retry_count") or 0) > 0
+            or current - float((item or {}).get("start_at") or 0) > ACTIVITY_SECONDS
+        )
+    ]
+    records.sort(key=lambda item: float(item.get("start_at") or 0), reverse=True)
+    records = records[:QUALITY_MAX_TURNS]
+    turn_count = len(records)
+    retry_turn_count = sum(1 for item in records if int(item.get("retry_count") or 0) > 0)
+    retry_count = sum(int(item.get("retry_count") or 0) for item in records)
+    first_attempt_success_count = sum(
+        1 for item in records
+        if item.get("has_output") and int(item.get("retry_count") or 0) == 0
+    )
+    first_attempt_success_pct = (
+        round(first_attempt_success_count / turn_count * 100) if turn_count else None
+    )
+    max_retries = max((int(item.get("retry_count") or 0) for item in records), default=0)
+    tls_eof_count = sum(int(item.get("tls_eof_count") or 0) for item in records)
+    connection_closed_count = sum(
+        int(item.get("connection_closed_count") or 0) for item in records
+    )
+    hard_failure_count = sum(
+        1 for item in records
+        if not item.get("has_output")
+        and current - float(item.get("start_at") or 0) > ACTIVITY_SECONDS
+    )
+    stable_streak = 0
+    for item in records:
+        if item.get("has_output") and int(item.get("retry_count") or 0) == 0:
+            stable_streak += 1
+        else:
+            break
+    retry_turn_pct = round(retry_turn_count / turn_count * 100) if turn_count else 0
+    severe = max_retries >= 3 or tls_eof_count >= 2 or hard_failure_count > 0
+    unstable_by_rate = (
+        (turn_count >= 5 and retry_turn_pct >= 20)
+        or (turn_count >= QUALITY_MIN_STABLE_TURNS and retry_turn_pct >= 10)
+    )
+    if severe or unstable_by_rate:
+        status = "unstable"
+    elif (
+        turn_count >= QUALITY_MIN_STABLE_TURNS
+        and first_attempt_success_pct is not None
+        and first_attempt_success_pct >= 95
+    ):
+        status = "stable"
+    else:
+        status = "observing"
+    confidence = "high" if turn_count >= 20 else ("medium" if turn_count >= 10 else "low")
+    return {
+        "node": node,
+        "status": status,
+        "confidence": confidence,
+        "turn_count": turn_count,
+        "required_turn_count": QUALITY_MIN_STABLE_TURNS,
+        "first_attempt_success_pct": first_attempt_success_pct,
+        "retry_turn_count": retry_turn_count,
+        "retry_turn_pct": retry_turn_pct,
+        "retry_count": retry_count,
+        "max_retries_per_turn": max_retries,
+        "opening_retry_count": sum(int(item.get("opening_retry_count") or 0) for item in records),
+        "tls_eof_count": tls_eof_count,
+        "connection_closed_count": connection_closed_count,
+        "hard_failure_count": hard_failure_count,
+        "stable_streak": stable_streak,
+    }
+
+
+def all_node_qualities(
+    history: dict[str, Any], now: float | None = None
+) -> dict[str, dict[str, Any]]:
+    nodes = {
+        str(item.get("node")) for item in (history.get("turns") or {}).values()
+        if (item or {}).get("node")
+    }
+    return {node: summarize_node_quality(history, node, now) for node in nodes}
+
+
+def choose_gpt_recommendation(
+    current_name: str | None,
+    node_results: list[dict[str, Any]],
+    node_qualities: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    qualities = node_qualities or {}
+    successful = [
+        item for item in node_results
+        if isinstance(item.get("median_ms"), int)
+        and item.get("success_count") == item.get("sample_count")
+    ]
+    successful.sort(key=lambda item: (
+        item.get("p90_ms") or 10**9,
+        item["median_ms"],
+        item.get("max_ms") or 10**9,
+    ))
     current = next((item for item in successful if item["name"] == current_name), None)
     best = successful[0] if successful else None
     recommended = None
-    if best and current and best["name"] != current["name"]:
-        required_gain = max(50, round(current["median_ms"] * 0.15))
-        if current["median_ms"] - best["median_ms"] >= required_gain:
-            recommended = best
-    elif best and current is None:
-        recommended = best
-    return {"current": current, "best": best, "recommended": recommended}
+    trial = None
+    current_quality = qualities.get(current_name or "") or {
+        "node": current_name,
+        "status": "observing",
+        "confidence": "low",
+        "turn_count": 0,
+        "required_turn_count": QUALITY_MIN_STABLE_TURNS,
+    }
+    current_status = current_quality.get("status")
+    if current is None and current_name:
+        current_status = "unavailable"
+        current_quality = {**current_quality, "status": "unavailable"}
+    if current_status in ("unstable", "unavailable"):
+        stable_candidates = [
+            item for item in successful
+            if item.get("name") != current_name
+            and (qualities.get(str(item.get("name"))) or {}).get("status") == "stable"
+        ]
+        stable_candidates.sort(key=lambda item: (
+            -(qualities[str(item["name"])].get("first_attempt_success_pct") or 0),
+            item.get("p90_ms") or 10**9,
+            item.get("median_ms") or 10**9,
+        ))
+        recommended = stable_candidates[0] if stable_candidates else None
+        if recommended is None:
+            trial = next(
+                (item for item in successful
+                 if item.get("name") != current_name
+                 and (qualities.get(str(item.get("name"))) or {}).get("status") != "unstable"),
+                None,
+            )
+    return {
+        "current": current,
+        "best": best,
+        "recommended": recommended,
+        "trial": trial,
+        "current_quality": current_quality,
+        "recommendation_kind": "stable" if recommended else ("trial" if trial else None),
+    }
 
 
 def _probe_gpt_node(socket_path: str, name: str) -> dict[str, Any]:
@@ -430,10 +776,12 @@ def _probe_gpt_node(socket_path: str, name: str) -> dict[str, Any]:
     return {
         "name": name,
         "median_ms": round(statistics.median(ordered)) if ordered else None,
+        "p90_ms": round(_percentile(ordered, 0.9)) if ordered else None,
         "min_ms": ordered[0] if ordered else None,
         "max_ms": ordered[-1] if ordered else None,
         "success_count": len(ordered),
         "sample_count": GPT_PROBE_ROUNDS,
+        "success_pct": round(len(ordered) / GPT_PROBE_ROUNDS * 100),
     }
 
 
@@ -450,7 +798,13 @@ def probe_gpt_nodes(socket_path: str = MIHOMO_SOCKET) -> dict[str, Any]:
         candidates = context["candidates"]
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(candidates))) as pool:
             results = list(pool.map(lambda name: _probe_gpt_node(socket_path, name), candidates))
-        ranking = choose_gpt_recommendation(context.get("current_name"), results)
+        history = load_quality_history()
+        qualities = all_node_qualities(history, updated)
+        for item in results:
+            item["quality"] = qualities.get(item["name"]) or summarize_node_quality(
+                history, item["name"], updated
+            )
+        ranking = choose_gpt_recommendation(context.get("current_name"), results, qualities)
         return {
             "available": True,
             "updated": updated,
@@ -459,7 +813,10 @@ def probe_gpt_nodes(socket_path: str = MIHOMO_SOCKET) -> dict[str, Any]:
             "current_name": context.get("current_name"),
             "current": ranking["current"],
             "recommended": ranking["recommended"],
+            "trial": ranking["trial"],
             "best": ranking["best"],
+            "current_quality": ranking["current_quality"],
+            "recommendation_kind": ranking["recommendation_kind"],
             "nodes": sorted(
                 results,
                 key=lambda item: (
@@ -472,7 +829,11 @@ def probe_gpt_nodes(socket_path: str = MIHOMO_SOCKET) -> dict[str, Any]:
         return {"available": False, "updated": updated, "error": f"GPT 节点测速失败: {exc}"}
 
 
-def switch_gpt_node(name: str, socket_path: str = MIHOMO_SOCKET) -> dict[str, Any]:
+def switch_gpt_node(
+    name: str,
+    socket_path: str = MIHOMO_SOCKET,
+    quality_path: str | None = QUALITY_PATH,
+) -> dict[str, Any]:
     """仅在明确按钮操作后切换；目标必须仍是当前非香港候选节点。"""
     proxies_payload = _unix_http_json(socket_path, "/proxies", timeout=0.5)
     context = resolve_gpt_proxy_context(proxies_payload)
@@ -488,7 +849,10 @@ def switch_gpt_node(name: str, socket_path: str = MIHOMO_SOCKET) -> dict[str, An
         method="PUT",
         payload={"name": target},
     )
-    return {"ok": status in (200, 204), "selector": selector, "name": target}
+    ok = status in (200, 204)
+    if ok and quality_path and context.get("current_name") != target:
+        record_node_switch(context.get("current_name"), target, path=quality_path)
+    return {"ok": ok, "selector": selector, "name": target}
 
 
 def read_proxy_state(
@@ -517,11 +881,25 @@ def read_proxy_state(
 
 def collect(log_path: str = LOG_PATH, now: float | None = None) -> dict[str, Any]:
     current = time.time() if now is None else now
+    proxy = read_proxy_state()
+    codex = read_codex_activity(log_path, current)
+    turns = codex.pop("_turns", [])
+    quality = None
+    if proxy.get("available") and proxy.get("name"):
+        try:
+            with quality_history_lock():
+                history = load_quality_history(now=current)
+                update_quality_history(history, str(proxy["name"]), turns, current)
+                save_quality_history(history)
+            quality = summarize_node_quality(history, str(proxy["name"]), current)
+        except OSError:
+            quality = None
     return {
         "updated": int(current),
         "tun": read_tun_state(),
-        "proxy": read_proxy_state(),
-        "codex": read_codex_activity(log_path, current),
+        "proxy": proxy,
+        "codex": codex,
+        "gpt_quality": quality,
     }
 
 

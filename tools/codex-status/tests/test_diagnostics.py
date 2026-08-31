@@ -8,7 +8,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from diagnostics import TARGET_CLIENT, TARGET_OUTPUT, TARGET_RETRY, TARGET_WEBSOCKET, _decode_chunked, analyze_codex_rows, choose_gpt_recommendation, evaluate_tun, read_codex_activity, read_proxy_state, read_tun_state, resolve_gpt_proxy_context, resolve_proxy_state, switch_gpt_node  # noqa: E402
+from diagnostics import TARGET_CLIENT, TARGET_OUTPUT, TARGET_RETRY, TARGET_WEBSOCKET, _decode_chunked, analyze_codex_rows, choose_gpt_recommendation, evaluate_tun, read_codex_activity, read_proxy_state, read_tun_state, resolve_gpt_proxy_context, resolve_proxy_state, summarize_node_quality, switch_gpt_node, update_quality_history  # noqa: E402
 
 TURN_A = "01a00000-0000-7000-8000-000000000001"
 TURN_B = "01a00000-0000-7000-8000-000000000002"
@@ -184,15 +184,90 @@ class DiagnosticsTests(unittest.TestCase):
 
     def test_gpt_recommendation_requires_meaningful_gain(self):
         results = [
-            {"name": "🇸🇬 新加坡 01", "median_ms": 130, "max_ms": 150},
-            {"name": "🇯🇵 日本 01", "median_ms": 170, "max_ms": 180},
-            {"name": "🇺🇸 美国 AI", "median_ms": 1200, "max_ms": 3000},
+            {"name": "🇸🇬 新加坡 01", "median_ms": 130, "p90_ms": 150, "max_ms": 150, "success_count": 5, "sample_count": 5},
+            {"name": "🇯🇵 日本 01", "median_ms": 170, "p90_ms": 180, "max_ms": 180, "success_count": 5, "sample_count": 5},
+            {"name": "🇺🇸 美国 AI", "median_ms": 1200, "p90_ms": 3000, "max_ms": 3000, "success_count": 5, "sample_count": 5},
         ]
-        picked = choose_gpt_recommendation("🇺🇸 美国 AI", results)
-        self.assertEqual(picked["recommended"]["name"], "🇸🇬 新加坡 01")
+        qualities = {
+            "🇺🇸 美国 AI": {"status": "unstable", "turn_count": 10},
+            "🇯🇵 日本 01": {"status": "stable", "turn_count": 20, "first_attempt_success_pct": 100},
+            "🇸🇬 新加坡 01": {"status": "observing", "turn_count": 2},
+        }
+        picked = choose_gpt_recommendation("🇺🇸 美国 AI", results, qualities)
+        self.assertEqual(picked["recommended"]["name"], "🇯🇵 日本 01")
+        self.assertEqual(picked["recommendation_kind"], "stable")
 
-        close = choose_gpt_recommendation("🇯🇵 日本 01", results[:2])
-        self.assertIsNone(close["recommended"])
+        stable_current = {**qualities, "🇺🇸 美国 AI": {"status": "stable", "turn_count": 20}}
+        quiet = choose_gpt_recommendation("🇺🇸 美国 AI", results, stable_current)
+        self.assertIsNone(quiet["recommended"])
+        self.assertIsNone(quiet["trial"])
+
+    def test_unstable_current_only_offers_unverified_candidate_as_trial(self):
+        results = [
+            {"name": "current", "median_ms": 300, "p90_ms": 400, "max_ms": 400, "success_count": 5, "sample_count": 5},
+            {"name": "candidate", "median_ms": 100, "p90_ms": 120, "max_ms": 120, "success_count": 5, "sample_count": 5},
+        ]
+        picked = choose_gpt_recommendation(
+            "current", results,
+            {"current": {"status": "unstable", "turn_count": 5},
+             "candidate": {"status": "observing", "turn_count": 0}},
+        )
+        self.assertIsNone(picked["recommended"])
+        self.assertEqual(picked["trial"]["name"], "candidate")
+        self.assertEqual(picked["recommendation_kind"], "trial")
+
+    def test_partial_probe_cannot_be_recommended(self):
+        results = [
+            {"name": "current", "median_ms": 500, "p90_ms": 600, "success_count": 5, "sample_count": 5},
+            {"name": "flaky", "median_ms": 50, "p90_ms": 70, "success_count": 4, "sample_count": 5},
+        ]
+        picked = choose_gpt_recommendation(
+            "current", results,
+            {"current": {"status": "unstable"},
+             "flaky": {"status": "stable", "first_attempt_success_pct": 100}},
+        )
+        self.assertIsNone(picked["recommended"])
+        self.assertIsNone(picked["trial"])
+
+    def test_quality_history_stable_and_unstable_states(self):
+        now = 1_800_000_000.0
+        stable_history = {"version": 1, "created_at": now - 1000, "turns": {}, "switches": []}
+        stable_turns = [
+            {"turn_id": f"stable-{index}", "start_at": now - index, "last_seen_at": now - index,
+             "has_output": True, "retry_count": 0}
+            for index in range(10)
+        ]
+        update_quality_history(stable_history, "日本", stable_turns, now)
+        stable = summarize_node_quality(stable_history, "日本", now)
+        self.assertEqual(stable["status"], "stable")
+        self.assertEqual(stable["first_attempt_success_pct"], 100)
+
+        unstable_history = {"version": 1, "created_at": now - 1000, "turns": {}, "switches": []}
+        unstable_turns = [
+            {"turn_id": "bad", "start_at": now - 10, "last_seen_at": now - 5,
+             "has_output": True, "retry_count": 3, "opening_retry_count": 3,
+             "tls_eof_count": 2}
+        ]
+        update_quality_history(unstable_history, "新加坡", unstable_turns, now)
+        unstable = summarize_node_quality(unstable_history, "新加坡", now)
+        self.assertEqual(unstable["status"], "unstable")
+        self.assertEqual(unstable["max_retries_per_turn"], 3)
+
+    def test_turn_overlapping_switch_grace_is_ignored(self):
+        now = 1_800_000_000.0
+        history = {
+            "version": 1,
+            "created_at": now - 1000,
+            "turns": {},
+            "switches": [{"at": now - 10, "from": "新加坡", "to": "日本"}],
+        }
+        turns = [{
+            "turn_id": "during-switch", "start_at": now - 20, "last_seen_at": now - 5,
+            "has_output": True, "retry_count": 3,
+        }]
+        update_quality_history(history, "日本", turns, now)
+        self.assertTrue(history["turns"]["during-switch"]["ignored_after_switch"])
+        self.assertEqual(summarize_node_quality(history, "新加坡", now)["turn_count"], 0)
 
     @mock.patch("diagnostics._unix_http_request")
     @mock.patch("diagnostics._unix_http_json")
@@ -210,7 +285,7 @@ class DiagnosticsTests(unittest.TestCase):
         }}
         request.return_value = (204, b"")
 
-        result = switch_gpt_node("🇸🇬 新加坡 01", "/tmp/test.sock")
+        result = switch_gpt_node("🇸🇬 新加坡 01", "/tmp/test.sock", quality_path=None)
 
         self.assertTrue(result["ok"])
         request.assert_called_once_with(
