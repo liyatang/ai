@@ -15,6 +15,18 @@ import quota_fetch  # noqa: E402
 
 
 class QuotaFetchTests(unittest.TestCase):
+    def test_parse_window_normalizes_fractional_percent(self):
+        window = quota_fetch.parse_gpt_window({
+            "limit_window_seconds": 604800,
+            "used_percent": 12.6,
+            "reset_at": 123,
+        })
+        self.assertEqual(window["id"], "周")
+        self.assertEqual(window["used_pct"], 13)
+        self.assertEqual(
+            quota_fetch.parse_gpt_window({"used_percent": 120})["used_pct"], 100
+        )
+
     def test_missing_codex_login_has_compact_degradation_reason(self):
         with tempfile.TemporaryDirectory() as directory:
             missing = os.path.join(directory, "auth.json")
@@ -82,6 +94,18 @@ class QuotaFetchTests(unittest.TestCase):
             destination.shutdown()
             source.server_close()
             destination.server_close()
+
+    def test_cache_is_written_with_private_permissions(self):
+        old_path = quota_fetch.CACHE_PATH
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                quota_fetch.CACHE_PATH = os.path.join(directory, "cache.json")
+                quota_fetch.save_cache({"gpt": {"ok": True}})
+                self.assertEqual(os.stat(quota_fetch.CACHE_PATH).st_mode & 0o777, 0o600)
+                with open(quota_fetch.CACHE_PATH) as file:
+                    self.assertTrue(json.load(file)["gpt"]["ok"])
+        finally:
+            quota_fetch.CACHE_PATH = old_path
 
 
 if __name__ == "__main__":

@@ -5,6 +5,43 @@
 import AppKit
 import Foundation
 
+private let runtimeLogQueue = DispatchQueue(label: "local.liyatang.aiquota.runtime-log")
+
+func recordRuntimeEvent(_ event: String) {
+    runtimeLogQueue.sync {
+        let directory = NSHomeDirectory() + "/.config/quota-widget"
+        let path = directory + "/app_events.log"
+        try? FileManager.default.createDirectory(
+            atPath: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let existing = (try? String(contentsOfFile: path, encoding: .utf8))?
+            .split(separator: "\n").suffix(99).map(String.init) ?? []
+        let formatter = ISO8601DateFormatter()
+        let lines = existing + ["\(formatter.string(from: Date())) \(event)"]
+        if let data = (lines.joined(separator: "\n") + "\n").data(using: .utf8) {
+            try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: path
+            )
+        }
+    }
+}
+
+struct GenerationGate {
+    private(set) var current = 0
+
+    mutating func invalidate() -> Int {
+        current += 1
+        return current
+    }
+
+    func accepts(_ token: Int) -> Bool {
+        token == current
+    }
+}
+
 // MARK: - 数据模型（与 quota_fetch.py 输出一致，字段名保持 snake_case 免映射）
 
 struct QuotaWindow: Codable {
@@ -36,6 +73,9 @@ struct TunStateData: Codable {
 struct ProxyStateData: Codable {
     let available: Bool
     let name: String?
+    let selected_name: String?
+    let active_name: String?
+    let transitioning: Bool?
     let source: String?
     let detail: String?
 }
@@ -114,7 +154,34 @@ struct GPTNodeBenchmark: Codable {
 struct GPTNodeSwitchResult: Codable {
     let ok: Bool
     let name: String?
+    let previous_name: String?
+    let actual_name: String?
     let error: String?
+}
+
+func normalizedNodeName(_ name: String?) -> String? {
+    guard let value = name?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+        return nil
+    }
+    return value
+}
+
+func matchingQuality(
+    for displayedNode: String?,
+    diagnostics: DiagnosticsData?,
+    benchmark: GPTNodeBenchmark?
+) -> GPTNodeQuality? {
+    guard let displayed = normalizedNodeName(displayedNode) else { return nil }
+    if let quality = diagnostics?.gpt_quality,
+       normalizedNodeName(quality.node) == displayed {
+        return quality
+    }
+    if normalizedNodeName(benchmark?.current_name) == displayed,
+       let quality = benchmark?.current_quality,
+       normalizedNodeName(quality.node) == displayed {
+        return quality
+    }
+    return nil
 }
 
 // MARK: - 数据抓取（复用 python 脚本，含缓存与错误兜底）
@@ -135,10 +202,17 @@ func fetchQuota() -> QuotaData? {
     p.standardError = FileHandle.nullDevice
     let pipe = Pipe()
     p.standardOutput = pipe
-    do { try p.run() } catch { return nil }
+    do { try p.run() } catch {
+        recordRuntimeEvent("quota process launch failed")
+        return nil
+    }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
-    return try? JSONDecoder().decode(QuotaData.self, from: data)
+    guard let decoded = try? JSONDecoder().decode(QuotaData.self, from: data) else {
+        recordRuntimeEvent("quota output decode failed")
+        return nil
+    }
+    return decoded
 }
 
 func fetchDiagnostics() -> DiagnosticsData? {
@@ -149,11 +223,21 @@ func fetchDiagnostics() -> DiagnosticsData? {
     p.standardError = FileHandle.nullDevice
     let pipe = Pipe()
     p.standardOutput = pipe
-    do { try p.run() } catch { return nil }
+    do { try p.run() } catch {
+        recordRuntimeEvent("diagnostics process launch failed")
+        return nil
+    }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
-    guard p.terminationStatus == 0 else { return nil }
-    return try? JSONDecoder().decode(DiagnosticsData.self, from: data)
+    guard p.terminationStatus == 0 else {
+        recordRuntimeEvent("diagnostics process exited \(p.terminationStatus)")
+        return nil
+    }
+    guard let decoded = try? JSONDecoder().decode(DiagnosticsData.self, from: data) else {
+        recordRuntimeEvent("diagnostics output decode failed")
+        return nil
+    }
+    return decoded
 }
 
 func runDiagnosticsScript(arguments: [String]) -> Data? {
@@ -164,10 +248,17 @@ func runDiagnosticsScript(arguments: [String]) -> Data? {
     process.standardError = FileHandle.nullDevice
     let pipe = Pipe()
     process.standardOutput = pipe
-    do { try process.run() } catch { return nil }
+    do { try process.run() } catch {
+        recordRuntimeEvent("diagnostics action launch failed")
+        return nil
+    }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     process.waitUntilExit()
-    return process.terminationStatus == 0 ? data : nil
+    guard process.terminationStatus == 0 else {
+        recordRuntimeEvent("diagnostics action exited \(process.terminationStatus)")
+        return nil
+    }
+    return data
 }
 
 func fetchGPTNodeBenchmark() -> GPTNodeBenchmark? {
@@ -468,11 +559,6 @@ func fmtRate(_ bps: Double) -> String {
     return String(format: "%.0f B/s", v)
 }
 
-func fmtGB(_ bytes: UInt64) -> String {
-    // GiB 口径，与活动监视器/Finder 的「GB」一致
-    String(format: "%.1f GB", Double(bytes) / 1_073_741_824)
-}
-
 /// 重置时间用绝对时间显示（和 ChatGPT 客户端一致）：今天 HH:mm / 明天 HH:mm / M/d HH:mm
 func resetText(_ resetAt: Double) -> String {
     let date = Date(timeIntervalSince1970: resetAt)
@@ -536,6 +622,21 @@ class CardView: NSView {
     var switchStatus: String? {
         didSet { needsDisplay = true }
     }
+    var switchTarget: String? {
+        didSet { needsDisplay = true }
+    }
+    var switchError: String? {
+        didSet { needsDisplay = true }
+    }
+    var quotaStale = false {
+        didSet { needsDisplay = true }
+    }
+    var diagnosticsStale = false {
+        didSet { needsDisplay = true }
+    }
+    var benchmarkError: String? {
+        didSet { needsDisplay = true }
+    }
     var onSwitchRecommended: ((String) -> Void)?
 
     let cardWidth: CGFloat = 330
@@ -576,13 +677,37 @@ class CardView: NSView {
 
     override var isFlipped: Bool { true }
 
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .group }
+    override func accessibilityLabel() -> String? { "Codex 状态" }
+    override func accessibilityValue() -> Any? {
+        var parts: [String] = []
+        if let window = data?.gpt?.windows?.first {
+            parts.append("GPT \(window.id)剩余\(max(0, 100 - (window.used_pct ?? 0)))%")
+        }
+        let selected = normalizedNodeName(switchTarget)
+            ?? normalizedNodeName(diagnostics?.proxy?.selected_name)
+            ?? normalizedNodeName(gptNodes?.current_name)
+            ?? normalizedNodeName(diagnostics?.proxy?.name)
+        if let selected { parts.append("节点\(selected)") }
+        if let quality = matchingQuality(for: selected, diagnostics: diagnostics, benchmark: gptNodes) {
+            parts.append("GPT稳定性\(quality.status)，\(quality.turn_count ?? 0)轮")
+        }
+        if diagnosticsStale { parts.append("连接诊断已过期") }
+        if let sys {
+            let mem = sys.memTotal > 0
+                ? min(100, Int(Double(sys.memUsed) / Double(sys.memTotal) * 100)) : 0
+            parts.append("CPU \(sys.cpuPct)%，内存 \(mem)%")
+        }
+        return parts.joined(separator: "；")
+    }
+
     enum Item {
         case header
         case divider
         case title(String, Bool)            // 标题, 是否缓存
         case win(QuotaWindow)
         case error(String)
-        case metric(String, String, NSColor) // 名称, 值, 状态色
         case summary(String, String, NSColor, String?, NSColor?) // 名称, 主摘要, 主色, 次摘要, 次色
         case recommendation(String, String, String, String?) // 标签, 节点, 状态, 按钮标题
         case latencyChart                    // 连接诊断：ChatGPT 延迟趋势
@@ -601,7 +726,7 @@ class CardView: NSView {
                 items.append(.error("未检测到 Codex；登录后显示额度"))
                 continue
             }
-            items.append(.title(label, side.stale ?? false))
+            items.append(.title(label, (side.stale ?? false) || quotaStale))
             if side.ok {
                 items.append(contentsOf: (side.windows ?? []).map { .win($0) })
             } else {
@@ -615,13 +740,16 @@ class CardView: NSView {
         let tun = diagnostics?.tun
         let tunSummary: String
         let tunColor: NSColor
-        switch tun?.state {
+        switch diagnosticsStale ? "stale" : tun?.state {
         case "enabled":
             tunSummary = " · TUN 正常"
             tunColor = greenColor
         case "disabled":
             tunSummary = " · TUN 未开启"
             tunColor = redColor
+        case "stale":
+            tunSummary = " · 诊断已过期"
+            tunColor = orangeColor
         default:
             tunSummary = " · TUN 检测中"
             tunColor = orangeColor
@@ -646,13 +774,15 @@ class CardView: NSView {
             networkColor = dimColor
         }
 
+        let selectedNode = normalizedNodeName(switchTarget)
+            ?? normalizedNodeName(diagnostics?.proxy?.selected_name)
+            ?? normalizedNodeName(gptNodes?.current_name)
+            ?? normalizedNodeName(diagnostics?.proxy?.name)
+        let activeNode = normalizedNodeName(diagnostics?.proxy?.active_name)
         let proxyValue: String
         let proxyColor: NSColor
-        if let name = gptNodes?.current_name, !name.isEmpty {
-            proxyValue = name.trimmingCharacters(in: .whitespacesAndNewlines)
-            proxyColor = greenColor
-        } else if let proxy = diagnostics?.proxy, proxy.available, let name = proxy.name, !name.isEmpty {
-            proxyValue = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let selectedNode {
+            proxyValue = selectedNode
             proxyColor = greenColor
         } else if tun?.state == "unavailable",
                   let detail = tun?.detail,
@@ -664,7 +794,11 @@ class CardView: NSView {
             proxyColor = orangeColor
         }
 
-        let quality = diagnostics?.gpt_quality ?? gptNodes?.current_quality
+        let quality = matchingQuality(
+            for: selectedNode,
+            diagnostics: diagnostics,
+            benchmark: gptNodes
+        )
         let qualityValue: String
         let qualityColor: NSColor
         switch quality?.status {
@@ -707,8 +841,9 @@ class CardView: NSView {
         if let status = switchStatus {
             recommendation = .recommendation(
                 "建议",
-                (gptNodes?.recommended ?? gptNodes?.trial)?.name
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? "建议节点",
+                normalizedNodeName(switchTarget)
+                    ?? normalizedNodeName((gptNodes?.recommended ?? gptNodes?.trial)?.name)
+                    ?? "建议节点",
                 status,
                 nil
             )
@@ -719,24 +854,34 @@ class CardView: NSView {
                 recommendation = .recommendation(
                     "建议切换",
                     suggested.name.trimmingCharacters(in: .whitespacesAndNewlines),
-                    "首连 \(stable?.first_attempt_success_pct ?? 0)% · \(stable?.turn_count ?? 0)轮验证",
+                    switchError ?? "首连 \(stable?.first_attempt_success_pct ?? 0)% · \(stable?.turn_count ?? 0)轮验证",
                     "切换"
                 )
             } else if let trial = nodes.trial {
                 recommendation = .recommendation(
                     "候选试用",
                     trial.name.trimmingCharacters(in: .whitespacesAndNewlines),
-                    "短测 P90 \(trial.p90_ms ?? trial.median_ms ?? 0) ms · 稳定性未验证",
+                    switchError ?? "短测 P90 \(trial.p90_ms ?? trial.median_ms ?? 0) ms · 稳定性未验证",
                     "试用"
                 )
             } else {
-                recommendation = .summary("建议", "暂无稳定候选", faintColor, nil, nil)
+                recommendation = switchError.map {
+                    .summary("切换失败", $0, redColor, nil, nil)
+                } ?? .summary("建议", "暂无稳定候选", faintColor, nil, nil)
             }
+        } else if ["unstable", "unavailable"].contains(currentStatus),
+                  gptNodes?.available == false {
+            recommendation = .summary(
+                "建议", "候选测速不可用", orangeColor,
+                benchmarkError.map { " · \($0)" }, dimColor
+            )
         } else if ["unstable", "unavailable"].contains(currentStatus) {
-            recommendation = .summary("建议", "暂无稳定候选", faintColor, nil, nil)
+            recommendation = switchError.map {
+                .summary("切换失败", $0, redColor, nil, nil)
+            } ?? .summary("建议", "正在比较候选", faintColor, nil, nil)
         }
 
-        let diagnosisResult = diagnosis()
+        let diagnosisResult = diagnosis(quality: quality)
         let confidence = confidenceSummary(from: diagnosisResult.detail)
         let codexSummary: String
         if ["连接不稳定", "网络慢", "模型/推理慢"].contains(diagnosisResult.title) {
@@ -748,9 +893,12 @@ class CardView: NSView {
             ? redColor
             : (["模型/推理慢"].contains(codexSummary) ? orangeColor : codexColor)
 
+        let nodeTransitioning = selectedNode != nil && activeNode != nil && selectedNode != activeNode
+        let nodeDetail = nodeTransitioning ? " · 旧连接收尾" : tunSummary
+        let nodeDetailColor = nodeTransitioning ? orangeColor : tunColor
         var items: [Item] = [
             .divider,
-            .summary("节点", proxyValue, proxyColor, tunSummary, tunColor),
+            .summary("节点", proxyValue, proxyColor, nodeDetail, nodeDetailColor),
             .summary("GPT", qualityValue, qualityColor, networkSummary, networkColor),
             .latencyChart,
             .summary("Codex", codexSummary, codexSummaryColor, " · \(confidence)", diagnosisResult.color),
@@ -767,11 +915,6 @@ class CardView: NSView {
         return "低可信度"
     }
 
-    private func shortModel(_ model: String?) -> String {
-        guard let model, !model.isEmpty else { return "?" }
-        return model.replacingOccurrences(of: "gpt-5.6-", with: "")
-    }
-
     private func slowThreshold(effort: String?) -> Double {
         switch effort {
         case "none", "low": return 6
@@ -782,10 +925,16 @@ class CardView: NSView {
         }
     }
 
-    private func diagnosis() -> (title: String, detail: String, color: NSColor) {
-        if diagnostics?.gpt_quality?.status == "unstable" {
-            let reconnects = diagnostics?.gpt_quality?.retry_count ?? 0
-            return ("连接不稳定", "真实对话检测到 \(reconnects) 次流重连 · 高可信度", redColor)
+    private func diagnosis(quality: GPTNodeQuality?) -> (title: String, detail: String, color: NSColor) {
+        if quality?.status == "unstable" {
+            let reconnects = quality?.retry_count ?? 0
+            let confidence: String
+            switch quality?.confidence {
+            case "high": confidence = "高"
+            case "medium": confidence = "中"
+            default: confidence = "低"
+            }
+            return ("连接不稳定", "真实对话检测到 \(reconnects) 次流重连 · \(confidence)可信度", redColor)
         }
         guard let n = network, n.sampleCount > 0 else {
             return ("无法确定", "等待网络样本 · 低可信度", orangeColor)
@@ -803,6 +952,9 @@ class CardView: NSView {
             return ("Codex 空闲", n.isHealthy ? "当前网络正常" : "网络样本仍在收集", faintColor)
         }
         if (codex.retry_count ?? 0) > 0 {
+            if diagnostics?.proxy?.transitioning == true {
+                return ("旧连接收尾", "切换前连接仍有重试 · 低可信度", orangeColor)
+            }
             return ("连接不稳定", "检测到 \(codex.retry_count ?? 0) 次流重连 · 中可信度", redColor)
         }
         guard let wait = codex.first_output_median_seconds else {
@@ -1071,7 +1223,6 @@ class CardView: NSView {
         case .title: return 24
         case .win: return 34
         case .error: return 22
-        case .metric: return 24
         case .summary: return 24
         case .recommendation: return 40
         case .latencyChart: return 71
@@ -1188,13 +1339,6 @@ class CardView: NSView {
                 t.draw(in: NSRect(x: padX, y: y + 2, width: contentW, height: 16))
                 y += itemHeight(item)
 
-            case .metric(let label, let value, let color):
-                attrString(label, size: 12, color: faintColor).draw(at: NSPoint(x: padX, y: y + 4))
-                let t = attrString(value, size: 12, weight: .medium, color: color)
-                let size = t.size()
-                t.draw(at: NSPoint(x: cardWidth - padX - size.width, y: y + 4))
-                y += itemHeight(item)
-
             case .summary(let label, let primary, let primaryColor, let secondary, let secondaryColor):
                 attrString(label, size: 12, color: faintColor).draw(at: NSPoint(x: padX, y: y + 4))
                 let paragraph = NSMutableParagraphStyle()
@@ -1248,6 +1392,9 @@ class CardView: NSView {
                         height: 25
                     )
                     switchButton.frame = rect
+                    switchButton.setAccessibilityLabel(
+                        "\(actionTitle)到 \(name.trimmingCharacters(in: .whitespacesAndNewlines))"
+                    )
                     switchButton.isEnabled = true
                     switchButton.isHidden = false
                 }
@@ -1298,6 +1445,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var diagnosticsRefreshInFlight = false
     private var nodeBenchmarkRefreshInFlight = false
     private var nodeSwitchInFlight = false
+    private var nodeBenchmarkGeneration = GenerationGate()
+    private var nodeBenchmarkRefreshRequested = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
         // 单实例：已有同名 app 在跑就退出（避免 open 重复拉起叠两张卡）
@@ -1335,11 +1484,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         card.onSwitchRecommended = { [weak self] name in
             self?.switchRecommendedNode(name)
         }
+        let contextMenu = NSMenu()
+        let refreshItem = NSMenuItem(title: "立即刷新", action: #selector(manualRefresh), keyEquivalent: "")
+        refreshItem.target = self
+        contextMenu.addItem(refreshItem)
+        contextMenu.addItem(.separator())
+        let quitItem = NSMenuItem(title: "退出 Codex 状态", action: #selector(quitApp), keyEquivalent: "")
+        quitItem.target = self
+        contextMenu.addItem(quitItem)
+        card.menu = contextMenu
         position()
         panel.orderFrontRegardless()
         refresh()
         refreshDiagnostics()
-        refreshGPTNodeBenchmark()
 
         sampleSys()   // 建立首个基线（CPU/网速等下次采样才有差分值）
         sysTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
@@ -1404,8 +1561,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.global().async { [weak self] in
             let d = fetchQuota()
             DispatchQueue.main.async {
-                self?.card.data = d
-                self?.position()
+                guard let self else { return }
+                if let d {
+                    self.card.data = d
+                    self.card.quotaStale = false
+                } else if self.card.data == nil {
+                    self.card.data = QuotaData(
+                        updated: Int(Date().timeIntervalSince1970),
+                        gpt: QuotaSide(
+                            ok: false, level: nil, windows: [],
+                            error: "额度数据不可用", stale: true
+                        )
+                    )
+                    self.card.quotaStale = true
+                } else {
+                    self.card.quotaStale = true
+                }
+                self.position()
             }
         }
     }
@@ -1419,7 +1591,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.diagnosticsRefreshInFlight = false
-                if let d { self.card.diagnostics = d }
+                if let d {
+                    self.card.diagnostics = d
+                    self.card.diagnosticsStale = false
+                    let benchmarkAge = Int(Date().timeIntervalSince1970)
+                        - (self.card.gptNodes?.updated ?? 0)
+                    if ["unstable", "unavailable"].contains(d.gpt_quality?.status ?? ""),
+                       self.card.gptNodes == nil || benchmarkAge >= 600 {
+                        self.refreshGPTNodeBenchmark()
+                    }
+                } else {
+                    self.card.diagnosticsStale = true
+                }
                 self.maybeProbeNetwork()
                 self.position()
             }
@@ -1440,21 +1623,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 节点测速使用 mihomo 的指定节点 URL 探针，不改变当前 Selector。
-    func refreshGPTNodeBenchmark() {
+    func refreshGPTNodeBenchmark(force: Bool = false) {
+        if !force {
+            let status = card.diagnostics?.gpt_quality?.status ?? ""
+            guard ["unstable", "unavailable"].contains(status) else { return }
+        }
+        if force {
+            _ = nodeBenchmarkGeneration.invalidate()
+            nodeBenchmarkRefreshRequested = true
+        }
         guard !nodeBenchmarkRefreshInFlight, !nodeSwitchInFlight else { return }
+        nodeBenchmarkRefreshRequested = false
+        let generation = nodeBenchmarkGeneration.current
         nodeBenchmarkRefreshInFlight = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let result = fetchGPTNodeBenchmark()
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.nodeBenchmarkRefreshInFlight = false
-                if let result {
+                if self.nodeBenchmarkGeneration.accepts(generation), let result {
                     self.card.gptNodes = result
-                    if self.card.switchStatus == "已切换，重新测速…" {
+                    self.card.benchmarkError = result.available ? nil : result.error
+                    if let target = normalizedNodeName(self.card.switchTarget),
+                       normalizedNodeName(result.current_name) == target {
+                        self.card.switchTarget = nil
                         self.card.switchStatus = nil
+                        self.card.switchError = nil
                     }
                 }
                 self.position()
+                if self.nodeBenchmarkRefreshRequested {
+                    self.refreshGPTNodeBenchmark()
+                }
             }
         }
     }
@@ -1463,6 +1663,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func switchRecommendedNode(_ name: String) {
         guard !nodeSwitchInFlight else { return }
         nodeSwitchInFlight = true
+        card.switchTarget = name
+        card.switchError = nil
         card.switchStatus = "切换中…"
         position()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -1471,22 +1673,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 self.nodeSwitchInFlight = false
                 if result?.ok == true {
-                    self.card.switchStatus = "已切换，重新测速…"
+                    self.card.switchTarget = result?.actual_name ?? result?.name ?? name
+                    self.card.switchStatus = "已确认，正在验证…"
                     self.networkHistory.reset()
                     self.card.clearLatencySamples()
                     self.lastProbeAt = .distantPast
                     self.refreshDiagnostics()
-                    self.refreshGPTNodeBenchmark()
+                    self.refreshGPTNodeBenchmark(force: true)
                 } else {
-                    self.card.switchStatus = result?.error ?? "切换失败"
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
-                        self?.card.switchStatus = nil
-                        self?.position()
-                    }
+                    self.card.switchTarget = nil
+                    self.card.switchStatus = nil
+                    self.card.switchError = result?.error ?? "上次切换失败"
                 }
                 self.position()
             }
         }
+    }
+
+    @objc private func manualRefresh() {
+        refresh()
+        refreshDiagnostics()
+        refreshGPTNodeBenchmark(force: true)
+    }
+
+    @objc private func quitApp() {
+        NSApp.terminate(nil)
     }
 
     /// 本地采样 CPU/内存/网络并刷新卡片；高度变化（系统区块首次出现）时重新锚定
@@ -1497,8 +1708,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+#if !TESTING
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
 app.run()
+#endif

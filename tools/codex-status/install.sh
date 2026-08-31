@@ -28,24 +28,23 @@ if [[ -z "$PYTHON" ]]; then
   exit 2
 fi
 
+SOURCE_STAMP="$SCRIPT_DIR/bin/AIQuota.source-sha256"
+if [[ ! -f "$SOURCE_STAMP" ]] || \
+   [[ "$(shasum -a 256 "$SCRIPT_DIR/app/main.swift" | awk '{print $1}')" != "$(tr -d '[:space:]' < "$SOURCE_STAMP")" ]]; then
+  echo "错误：预编译 AIQuota 与 main.swift 不一致，请先运行 ./build.sh。"
+  exit 3
+fi
+
 if [[ ! -f "$USER_HOME/.codex/auth.json" ]]; then
   echo "提示：尚未检测到 Codex 登录态。App 可以安装，但额度会在登录 Codex 后才显示。"
 fi
 
-mkdir -p "$USER_HOME/Applications" "$SUPPORT_DIR"
-chmod 700 "$SUPPORT_DIR"
-
-cp "$SCRIPT_DIR/quota_fetch.py" "$SUPPORT_DIR/quota_fetch.py"
-cp "$SCRIPT_DIR/diagnostics.py" "$SUPPORT_DIR/diagnostics.py"
-chmod 700 "$SUPPORT_DIR/quota_fetch.py" "$SUPPORT_DIR/diagnostics.py"
-
-if [[ ! -f "$SUPPORT_DIR/config.json" ]]; then
-  cp "$SCRIPT_DIR/config.example.json" "$SUPPORT_DIR/config.json"
-fi
-chmod 600 "$SUPPORT_DIR/config.json"
-
 BUILD_ROOT="$(mktemp -d)"
-trap 'rm -rf "$BUILD_ROOT"' EXIT
+cleanup() {
+  rm -rf "$BUILD_ROOT"
+  rm -f "$SUPPORT_DIR/quota_fetch.py.next" "$SUPPORT_DIR/diagnostics.py.next"
+}
+trap cleanup EXIT
 BUILD_APP="$BUILD_ROOT/Codex 状态.app"
 mkdir -p "$BUILD_APP/Contents/MacOS"
 cp "$SCRIPT_DIR/app/Info.plist" "$BUILD_APP/Contents/Info.plist"
@@ -53,6 +52,18 @@ cp "$SCRIPT_DIR/bin/AIQuota" "$BUILD_APP/Contents/MacOS/AIQuota"
 chmod 755 "$BUILD_APP/Contents/MacOS/AIQuota"
 codesign --force --sign - "$BUILD_APP" >/dev/null
 codesign --verify --deep --strict "$BUILD_APP"
+
+# 先完成 App 构建与签名验证，再更新运行脚本，避免构建失败时留下新旧版本混用。
+mkdir -p "$USER_HOME/Applications" "$SUPPORT_DIR"
+chmod 700 "$SUPPORT_DIR"
+cp "$SCRIPT_DIR/quota_fetch.py" "$SUPPORT_DIR/quota_fetch.py.next"
+cp "$SCRIPT_DIR/diagnostics.py" "$SUPPORT_DIR/diagnostics.py.next"
+chmod 700 "$SUPPORT_DIR/quota_fetch.py.next" "$SUPPORT_DIR/diagnostics.py.next"
+
+if [[ ! -f "$SUPPORT_DIR/config.json" ]]; then
+  cp "$SCRIPT_DIR/config.example.json" "$SUPPORT_DIR/config.json"
+fi
+chmod 600 "$SUPPORT_DIR/config.json"
 
 if [[ "${CODEX_STATUS_SKIP_STOP:-0}" != "1" ]]; then
   for app_executable in "$EXECUTABLE" "$LEGACY_EXECUTABLE"; do
@@ -72,12 +83,18 @@ for existing_app in "$APP_DIR" "$LEGACY_APP_DIR"; do
   echo "旧版本已移到废纸篓：$BACKUP_APP"
 done
 mv "$BUILD_APP" "$APP_DIR"
+mv "$SUPPORT_DIR/quota_fetch.py.next" "$SUPPORT_DIR/quota_fetch.py"
+mv "$SUPPORT_DIR/diagnostics.py.next" "$SUPPORT_DIR/diagnostics.py"
 if [[ "${CODEX_STATUS_SKIP_LAUNCH:-0}" != "1" ]]; then
   open "$APP_DIR"
 fi
 
 echo ""
-echo "Codex 状态已安装并启动。"
+if [[ "${CODEX_STATUS_SKIP_LAUNCH:-0}" == "1" ]]; then
+  echo "Codex 状态已安装（未启动）。"
+else
+  echo "Codex 状态已安装并启动。"
+fi
 echo "App：$APP_DIR"
 echo "Python：$PYTHON"
 echo "如需开机启动，请在 系统设置 → 通用 → 登录项 中手动添加。"

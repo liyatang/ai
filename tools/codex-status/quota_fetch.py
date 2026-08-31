@@ -80,10 +80,15 @@ def parse_gpt_window(w):
     if not w:
         return None
     secs = w.get("limit_window_seconds", 0)
+    raw_used = w.get("used_percent", 0)
+    try:
+        used_pct = max(0, min(100, round(float(raw_used))))
+    except (TypeError, ValueError):
+        used_pct = 0
     name = {18000: "5h", 604800: "周"}.get(secs, f"{secs // 86400}d" if secs >= 86400 else f"{secs // 3600}h")
     return {
         "id": name,
-        "used_pct": w.get("used_percent", 0),
+        "used_pct": used_pct,
         "remaining": None,
         "total": None,
         "reset_at": w.get("reset_at"),
@@ -154,6 +159,24 @@ def fetch_gpt(cfg, timeout, proxy):
     return fetch_gpt_session(gcfg, timeout, proxy)
 
 
+def save_cache(cache):
+    directory = os.path.dirname(CACHE_PATH)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    temporary = f"{CACHE_PATH}.tmp-{os.getpid()}"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            json.dump(cache, file, ensure_ascii=False)
+        os.replace(temporary, CACHE_PATH)
+        os.chmod(CACHE_PATH, 0o600)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
 # ---------------- main ----------------
 
 def main():
@@ -191,8 +214,7 @@ def main():
     if changed:
         cache["updated"] = result["updated"]
         try:
-            with open(CACHE_PATH, "w") as f:
-                json.dump(cache, f, ensure_ascii=False)
+            save_cache(cache)
         except Exception:
             pass
     print(json.dumps(result, ensure_ascii=False))

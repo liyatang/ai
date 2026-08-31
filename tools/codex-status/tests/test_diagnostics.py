@@ -8,7 +8,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from diagnostics import TARGET_CLIENT, TARGET_OUTPUT, TARGET_RETRY, TARGET_WEBSOCKET, _decode_chunked, analyze_codex_rows, choose_gpt_recommendation, evaluate_tun, read_codex_activity, read_proxy_state, read_tun_state, resolve_gpt_proxy_context, resolve_proxy_state, summarize_node_quality, switch_gpt_node, update_quality_history  # noqa: E402
+from diagnostics import TARGET_CLIENT, TARGET_OUTPUT, TARGET_RETRY, TARGET_WEBSOCKET, _decode_chunked, analyze_codex_rows, choose_gpt_recommendation, evaluate_tun, read_codex_activity, read_proxy_state, read_tun_state, record_switch_audit, resolve_gpt_proxy_context, resolve_proxy_state, summarize_node_quality, switch_gpt_node, update_quality_history  # noqa: E402
 
 TURN_A = "01a00000-0000-7000-8000-000000000001"
 TURN_B = "01a00000-0000-7000-8000-000000000002"
@@ -160,7 +160,26 @@ class DiagnosticsTests(unittest.TestCase):
         }
         result = resolve_proxy_state({"proxies": proxies}, {"connections": []})
         self.assertEqual(result["name"], "🇯🇵 日本 AI")
+        self.assertEqual(result["selected_name"], "🇯🇵 日本 AI")
         self.assertEqual(result["source"], "policy")
+
+    def test_proxy_keeps_selected_and_active_nodes_separate(self):
+        proxies = {
+            "🤖 AI": {"now": "🔰 手动选择"},
+            "🔰 手动选择": {"now": "🇯🇵 日本 01"},
+            "🇯🇵 日本 01": {"type": "Vless"},
+        }
+        result = resolve_proxy_state(
+            {"proxies": proxies},
+            {"connections": [{
+                "metadata": {"host": "chatgpt.com"},
+                "chains": ["🇺🇸 美国 AI", "🔰 手动选择", "🤖 AI"],
+            }]},
+        )
+        self.assertEqual(result["name"], "🇯🇵 日本 01")
+        self.assertEqual(result["selected_name"], "🇯🇵 日本 01")
+        self.assertEqual(result["active_name"], "🇺🇸 美国 AI")
+        self.assertTrue(result["transitioning"])
 
     def test_gpt_context_uses_deep_selector_and_excludes_hong_kong(self):
         proxies = {
@@ -269,10 +288,20 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertTrue(history["turns"]["during-switch"]["ignored_after_switch"])
         self.assertEqual(summarize_node_quality(history, "新加坡", now)["turn_count"], 0)
 
+    def test_switch_audit_is_private_and_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "switch_audit.jsonl")
+            for index in range(5):
+                record_switch_audit({"at": index, "ok": True}, path=path, limit=3)
+            with open(path, encoding="utf-8") as file:
+                entries = [line for line in file.read().splitlines() if line]
+            self.assertEqual(len(entries), 3)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
     @mock.patch("diagnostics._unix_http_request")
     @mock.patch("diagnostics._unix_http_json")
     def test_switch_gpt_node_targets_resolved_selector(self, read_json, request):
-        read_json.return_value = {"proxies": {
+        before = {"proxies": {
             "🤖 AI": {"type": "Selector", "now": "🔰 手动选择", "all": ["🔰 手动选择"]},
             "🔰 手动选择": {
                 "type": "Selector",
@@ -283,11 +312,22 @@ class DiagnosticsTests(unittest.TestCase):
             "🇸🇬 新加坡 01": {"type": "Vless"},
             "🇺🇸 美国 AI": {"type": "Vless"},
         }}
+        after = {"proxies": {
+            **before["proxies"],
+            "🔰 手动选择": {
+                **before["proxies"]["🔰 手动选择"],
+                "now": "🇸🇬 新加坡 01",
+            },
+        }}
+        read_json.side_effect = [before, after]
         request.return_value = (204, b"")
 
-        result = switch_gpt_node("🇸🇬 新加坡 01", "/tmp/test.sock", quality_path=None)
+        result = switch_gpt_node(
+            "🇸🇬 新加坡 01", "/tmp/test.sock", quality_path=None, audit_path=None
+        )
 
         self.assertTrue(result["ok"])
+        self.assertEqual(result["actual_name"], "🇸🇬 新加坡 01")
         request.assert_called_once_with(
             "/tmp/test.sock",
             "/proxies/%F0%9F%94%B0%20%E6%89%8B%E5%8A%A8%E9%80%89%E6%8B%A9",
@@ -295,6 +335,29 @@ class DiagnosticsTests(unittest.TestCase):
             method="PUT",
             payload={"name": "🇸🇬 新加坡 01"},
         )
+
+    @mock.patch("diagnostics._unix_http_request", return_value=(204, b""))
+    @mock.patch("diagnostics._unix_http_json")
+    def test_switch_gpt_node_rejects_unconfirmed_selector(self, read_json, _request):
+        payload = {"proxies": {
+            "🤖 AI": {"type": "Selector", "now": "🔰 手动选择", "all": ["🔰 手动选择"]},
+            "🔰 手动选择": {
+                "type": "Selector",
+                "now": "🇺🇸 美国 AI",
+                "all": ["🇸🇬 新加坡 01", "🇺🇸 美国 AI"],
+            },
+            "🇸🇬 新加坡 01": {"type": "Vless"},
+            "🇺🇸 美国 AI": {"type": "Vless"},
+        }}
+        read_json.side_effect = [payload, payload]
+
+        result = switch_gpt_node(
+            "🇸🇬 新加坡 01", "/tmp/test.sock", quality_path=None, audit_path=None
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["actual_name"], "🇺🇸 美国 AI")
+        self.assertIn("实际仍为", result["error"])
 
     def test_decodes_chunked_mihomo_response(self):
         self.assertEqual(_decode_chunked(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n"), b"Wikipedia")

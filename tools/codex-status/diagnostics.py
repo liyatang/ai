@@ -26,6 +26,7 @@ from typing import Any
 
 LOG_PATH = os.path.expanduser("~/.codex/logs_2.sqlite")
 QUALITY_PATH = os.path.expanduser("~/.config/quota-widget/gpt_node_quality.json")
+SWITCH_AUDIT_PATH = os.path.expanduser("~/.config/quota-widget/switch_audit.jsonl")
 MIHOMO_SOCKET = "/tmp/verge/verge-mihomo.sock"
 CLASH_APP_PATHS = (
     "/Applications/Clash Verge.app",
@@ -381,8 +382,9 @@ def read_tun_state(
 
 
 def resolve_proxy_state(proxies_payload: dict[str, Any], connections_payload: dict[str, Any]) -> dict[str, Any]:
-    """优先取 ChatGPT 活连接的实际叶子节点，无连接时递归解析 AI 策略组。"""
+    """同时返回 selector 选中节点与现有 ChatGPT 活连接的实际叶子节点。"""
     connections = connections_payload.get("connections") or []
+    active_name = None
     for connection in connections:
         metadata = connection.get("metadata") or {}
         host = str(metadata.get("host") or "").lower()
@@ -390,7 +392,8 @@ def resolve_proxy_state(proxies_payload: dict[str, Any], connections_payload: di
             continue
         chains = [str(item).strip() for item in (connection.get("chains") or []) if str(item).strip()]
         if chains:
-            return {"available": True, "name": chains[0], "source": "connection"}
+            active_name = chains[0]
+            break
 
     proxies = proxies_payload.get("proxies") or {}
     candidates = [
@@ -399,10 +402,18 @@ def resolve_proxy_state(proxies_payload: dict[str, Any], connections_payload: di
     ]
     candidates.sort(key=lambda name: (0 if "🤖" in name else 1, len(name)))
     if not candidates:
-        return {"available": False, "name": None, "source": "unavailable"}
+        return {
+            "available": active_name is not None,
+            "name": active_name,
+            "selected_name": None,
+            "active_name": active_name,
+            "transitioning": False,
+            "source": "connection" if active_name else "unavailable",
+        }
 
     current = candidates[0]
     visited: set[str] = set()
+    selected_name = None
     while current and current not in visited:
         visited.add(current)
         item = proxies.get(current) or {}
@@ -410,9 +421,20 @@ def resolve_proxy_state(proxies_payload: dict[str, Any], connections_payload: di
         if not selected:
             break
         if selected not in proxies or not (proxies.get(selected) or {}).get("now"):
-            return {"available": True, "name": selected, "source": "policy"}
+            selected_name = selected
+            break
         current = selected
-    return {"available": False, "name": None, "source": "unavailable"}
+    name = selected_name or active_name
+    return {
+        "available": name is not None,
+        "name": name,
+        "selected_name": selected_name,
+        "active_name": active_name,
+        "transitioning": bool(
+            selected_name and active_name and selected_name.strip() != active_name.strip()
+        ),
+        "source": "policy" if selected_name else ("connection" if active_name else "unavailable"),
+    }
 
 
 def resolve_gpt_proxy_context(proxies_payload: dict[str, Any]) -> dict[str, Any]:
@@ -534,6 +556,40 @@ def record_node_switch(
         history["switches"].append({"at": changed_at, "from": previous, "to": target})
         history["updated"] = changed_at
         save_quality_history(history, path)
+
+
+def record_switch_audit(
+    entry: dict[str, Any], path: str = SWITCH_AUDIT_PATH, limit: int = 100
+) -> None:
+    """原子保存最近的本地切换结果，不包含请求内容或认证信息。"""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    lock_descriptor = os.open(f"{path}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        lines: list[str] = []
+        try:
+            with open(path, encoding="utf-8") as file:
+                lines = file.read().splitlines()[-max(0, limit - 1):]
+        except OSError:
+            pass
+        lines.append(json.dumps(entry, ensure_ascii=False, separators=(",", ":")))
+        temporary = f"{path}.tmp-{os.getpid()}"
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+                file.write("\n".join(lines) + "\n")
+            os.replace(temporary, path)
+            os.chmod(path, 0o600)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+    finally:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        os.close(lock_descriptor)
 
 
 def _node_for_turn(
@@ -833,13 +889,24 @@ def switch_gpt_node(
     name: str,
     socket_path: str = MIHOMO_SOCKET,
     quality_path: str | None = QUALITY_PATH,
+    audit_path: str | None = SWITCH_AUDIT_PATH,
 ) -> dict[str, Any]:
-    """仅在明确按钮操作后切换；目标必须仍是当前非香港候选节点。"""
+    """仅在明确按钮操作后切换，并回读 selector 确认实际结果。"""
     proxies_payload = _unix_http_json(socket_path, "/proxies", timeout=0.5)
     context = resolve_gpt_proxy_context(proxies_payload)
     target = name
+    previous = context.get("current_name")
     if not context.get("available") or target not in context.get("candidates", []):
-        return {"ok": False, "error": "目标节点不可用或已被排除"}
+        result = {
+            "ok": False,
+            "name": target,
+            "previous_name": previous,
+            "actual_name": previous,
+            "error": "目标节点不可用或已被排除",
+        }
+        if audit_path:
+            record_switch_audit({"at": int(time.time()), **result}, path=audit_path)
+        return result
     selector = context["selector"]
     path = "/proxies/" + urllib.parse.quote(selector, safe="")
     status, _ = _unix_http_request(
@@ -849,10 +916,32 @@ def switch_gpt_node(
         method="PUT",
         payload={"name": target},
     )
-    ok = status in (200, 204)
-    if ok and quality_path and context.get("current_name") != target:
-        record_node_switch(context.get("current_name"), target, path=quality_path)
-    return {"ok": ok, "selector": selector, "name": target}
+    accepted = status in (200, 204)
+    actual = None
+    error = None
+    if accepted:
+        try:
+            confirmed_payload = _unix_http_json(socket_path, "/proxies", timeout=0.5)
+            confirmed = resolve_gpt_proxy_context(confirmed_payload)
+            actual = confirmed.get("current_name")
+        except (OSError, ValueError, KeyError, json.JSONDecodeError, socket.timeout):
+            error = "切换请求已发送，但无法回读确认"
+    ok = accepted and actual == target
+    if accepted and actual is not None and actual != target:
+        error = f"selector 实际仍为 {str(actual).strip()}"
+    if ok and quality_path and previous != target:
+        record_node_switch(previous, target, path=quality_path)
+    result = {
+        "ok": ok,
+        "selector": selector,
+        "name": target,
+        "previous_name": previous,
+        "actual_name": actual,
+        **({"error": error or "切换未确认"} if not ok else {}),
+    }
+    if audit_path:
+        record_switch_audit({"at": int(time.time()), **result}, path=audit_path)
+    return result
 
 
 def read_proxy_state(
@@ -885,13 +974,14 @@ def collect(log_path: str = LOG_PATH, now: float | None = None) -> dict[str, Any
     codex = read_codex_activity(log_path, current)
     turns = codex.pop("_turns", [])
     quality = None
-    if proxy.get("available") and proxy.get("name"):
+    quality_node = proxy.get("selected_name") or proxy.get("name")
+    if proxy.get("available") and quality_node:
         try:
             with quality_history_lock():
                 history = load_quality_history(now=current)
-                update_quality_history(history, str(proxy["name"]), turns, current)
+                update_quality_history(history, str(quality_node), turns, current)
                 save_quality_history(history)
-            quality = summarize_node_quality(history, str(proxy["name"]), current)
+            quality = summarize_node_quality(history, str(quality_node), current)
         except OSError:
             quality = None
     return {
