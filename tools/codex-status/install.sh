@@ -6,6 +6,8 @@ USER_HOME="${CODEX_STATUS_TEST_HOME:-$HOME}"
 SUPPORT_DIR="$USER_HOME/.config/quota-widget"
 APP_DIR="$USER_HOME/Applications/Codex 状态.app"
 EXECUTABLE="$APP_DIR/Contents/MacOS/AIQuota"
+LEGACY_APP_DIR="$USER_HOME/Applications/AI Quota.app"
+LEGACY_EXECUTABLE="$LEGACY_APP_DIR/Contents/MacOS/AIQuota"
 
 if [[ "$(uname -m)" != "arm64" ]]; then
   echo "错误：当前安装包仅支持 Apple Silicon（M 系列芯片）。"
@@ -53,16 +55,22 @@ codesign --force --sign - "$BUILD_APP" >/dev/null
 codesign --verify --deep --strict "$BUILD_APP"
 
 if [[ "${CODEX_STATUS_SKIP_STOP:-0}" != "1" ]]; then
-  while IFS= read -r pid; do
-    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
-  done < <(pgrep -f -x "$EXECUTABLE" 2>/dev/null || true)
+  for app_executable in "$EXECUTABLE" "$LEGACY_EXECUTABLE"; do
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+    done < <(pgrep -f -x "$app_executable" 2>/dev/null || true)
+  done
 fi
-if [[ -d "$APP_DIR" ]]; then
+for existing_app in "$APP_DIR" "$LEGACY_APP_DIR"; do
+  if [[ ! -d "$existing_app" ]]; then
+    continue
+  fi
   mkdir -p "$USER_HOME/.Trash"
-  BACKUP_APP="$USER_HOME/.Trash/Codex 状态-更新前-$(date +%Y%m%d-%H%M%S).app"
-  mv "$APP_DIR" "$BACKUP_APP"
+  APP_NAME="$(basename "$existing_app" .app)"
+  BACKUP_APP="$USER_HOME/.Trash/$APP_NAME-更新前-$(date +%Y%m%d-%H%M%S).app"
+  mv "$existing_app" "$BACKUP_APP"
   echo "旧版本已移到废纸篓：$BACKUP_APP"
-fi
+done
 mv "$BUILD_APP" "$APP_DIR"
 if [[ "${CODEX_STATUS_SKIP_LAUNCH:-0}" != "1" ]]; then
   open "$APP_DIR"

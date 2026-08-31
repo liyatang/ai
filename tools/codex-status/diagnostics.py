@@ -8,6 +8,7 @@ Clash/mihomo 本机状态；不输出或缓存提示词、工具参数、工作�
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import sqlite3
 import statistics
 import subprocess
 import time
+import urllib.parse
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,6 +32,10 @@ CLASH_APP_PATHS = (
 )
 ACTIVITY_SECONDS = 300
 MAX_ROWS = 20_000
+GPT_PROBE_URL = "https://chatgpt.com/cdn-cgi/trace"
+GPT_PROBE_ROUNDS = 3
+GPT_PROBE_TIMEOUT_MS = 6_000
+GROUP_PROXY_TYPES = frozenset(("Selector", "URLTest", "Fallback", "LoadBalance"))
 
 TARGET_WEBSOCKET = "codex_api::endpoint::responses_websocket"
 TARGET_CLIENT = "codex_core::client"
@@ -191,14 +197,26 @@ def read_codex_activity(path: str = LOG_PATH, now: float | None = None) -> dict[
         return {"available": False, "active": False, "error": f"Codex 日志不可用: {exc}"}
 
 
-def _unix_http_json(socket_path: str, path: str, timeout: float = 0.25) -> dict[str, Any]:
+def _unix_http_request(
+    socket_path: str,
+    path: str,
+    timeout: float = 0.25,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+) -> tuple[int, bytes]:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(timeout)
     try:
         client.connect(socket_path)
-        client.sendall(
-            f"GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".encode()
-        )
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else b""
+        headers = [
+            f"{method} {path} HTTP/1.1",
+            "Host: localhost",
+            "Connection: close",
+        ]
+        if body:
+            headers.extend(("Content-Type: application/json", f"Content-Length: {len(body)}"))
+        client.sendall(("\r\n".join(headers) + "\r\n\r\n").encode() + body)
         chunks: list[bytes] = []
         while True:
             chunk = client.recv(65_536)
@@ -207,11 +225,20 @@ def _unix_http_json(socket_path: str, path: str, timeout: float = 0.25) -> dict[
             chunks.append(chunk)
         raw = b"".join(chunks)
         headers, body = raw.split(b"\r\n\r\n", 1)
+        status_line = headers.split(b"\r\n", 1)[0]
+        status = int(status_line.split(b" ", 2)[1])
         if b"transfer-encoding: chunked" in headers.lower():
             body = _decode_chunked(body)
-        return json.loads(body.decode("utf-8"))
+        if status >= 400:
+            raise OSError(f"mihomo HTTP {status}")
+        return status, body
     finally:
         client.close()
+
+
+def _unix_http_json(socket_path: str, path: str, timeout: float = 0.25) -> dict[str, Any]:
+    _, body = _unix_http_request(socket_path, path, timeout=timeout)
+    return json.loads(body.decode("utf-8"))
 
 
 def _decode_chunked(data: bytes) -> bytes:
@@ -313,6 +340,157 @@ def resolve_proxy_state(proxies_payload: dict[str, Any], connections_payload: di
     return {"available": False, "name": None, "source": "unavailable"}
 
 
+def resolve_gpt_proxy_context(proxies_payload: dict[str, Any]) -> dict[str, Any]:
+    """解析 GPT 策略链中可安全切换的最深 Selector 及其叶子节点。"""
+    proxies = proxies_payload.get("proxies") or {}
+    ai_groups = [
+        name for name, item in proxies.items()
+        if (item or {}).get("type") == "Selector"
+        and re.search(r"(^|\W)(ai|openai|chatgpt)(\W|$)", name, re.IGNORECASE)
+    ]
+    ai_groups.sort(key=lambda name: (0 if "🤖" in name else 1, len(name)))
+    if not ai_groups:
+        return {"available": False, "error": "未找到 GPT 代理策略组"}
+
+    current = ai_groups[0]
+    selector = current
+    visited: set[str] = set()
+    while current and current not in visited:
+        visited.add(current)
+        item = proxies.get(current) or {}
+        if item.get("type") == "Selector":
+            selector = current
+        selected = str(item.get("now") or "")
+        if not selected.strip():
+            break
+        current = selected
+
+    selector_item = proxies.get(selector) or {}
+    candidates = []
+    for raw_name in selector_item.get("all") or []:
+        name = str(raw_name)
+        display_name = name.strip()
+        item = proxies.get(name) or {}
+        if not display_name or item.get("type") in GROUP_PROXY_TYPES or item.get("all"):
+            continue
+        if re.search(r"香港|hong\s*kong|\bhk\b", display_name, re.IGNORECASE):
+            continue
+        if re.search(r"direct|reject|pass|直连", display_name, re.IGNORECASE) and "美国" not in display_name:
+            continue
+        candidates.append(name)
+
+    if not candidates:
+        return {"available": False, "error": "没有可测速的非香港 GPT 节点"}
+    return {
+        "available": True,
+        "selector": selector,
+        "current_name": current if current else None,
+        "candidates": candidates,
+    }
+
+
+def choose_gpt_recommendation(
+    current_name: str | None, node_results: list[dict[str, Any]]
+) -> dict[str, Any]:
+    successful = [item for item in node_results if isinstance(item.get("median_ms"), int)]
+    successful.sort(key=lambda item: (item["median_ms"], item.get("max_ms") or 10**9))
+    current = next((item for item in successful if item["name"] == current_name), None)
+    best = successful[0] if successful else None
+    recommended = None
+    if best and current and best["name"] != current["name"]:
+        required_gain = max(50, round(current["median_ms"] * 0.15))
+        if current["median_ms"] - best["median_ms"] >= required_gain:
+            recommended = best
+    elif best and current is None:
+        recommended = best
+    return {"current": current, "best": best, "recommended": recommended}
+
+
+def _probe_gpt_node(socket_path: str, name: str) -> dict[str, Any]:
+    encoded_name = urllib.parse.quote(name, safe="")
+    encoded_url = urllib.parse.quote(GPT_PROBE_URL, safe="")
+    path = (
+        f"/proxies/{encoded_name}/delay?url={encoded_url}"
+        f"&timeout={GPT_PROBE_TIMEOUT_MS}"
+    )
+    samples: list[int] = []
+    for _ in range(GPT_PROBE_ROUNDS):
+        try:
+            payload = _unix_http_json(
+                socket_path,
+                path,
+                timeout=GPT_PROBE_TIMEOUT_MS / 1000 + 1,
+            )
+            delay = payload.get("delay")
+            if isinstance(delay, int) and delay > 0:
+                samples.append(delay)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError, socket.timeout):
+            continue
+    ordered = sorted(samples)
+    return {
+        "name": name,
+        "median_ms": round(statistics.median(ordered)) if ordered else None,
+        "min_ms": ordered[0] if ordered else None,
+        "max_ms": ordered[-1] if ordered else None,
+        "success_count": len(ordered),
+        "sample_count": GPT_PROBE_ROUNDS,
+    }
+
+
+def probe_gpt_nodes(socket_path: str = MIHOMO_SOCKET) -> dict[str, Any]:
+    """不改变选择器，让每个候选节点分别访问 ChatGPT 真实端点。"""
+    updated = int(time.time())
+    if not os.path.exists(socket_path):
+        return {"available": False, "updated": updated, "error": "Clash Verge 未连接"}
+    try:
+        proxies_payload = _unix_http_json(socket_path, "/proxies", timeout=0.5)
+        context = resolve_gpt_proxy_context(proxies_payload)
+        if not context.get("available"):
+            return {**context, "updated": updated}
+        candidates = context["candidates"]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(candidates))) as pool:
+            results = list(pool.map(lambda name: _probe_gpt_node(socket_path, name), candidates))
+        ranking = choose_gpt_recommendation(context.get("current_name"), results)
+        return {
+            "available": True,
+            "updated": updated,
+            "probe_url": GPT_PROBE_URL,
+            "selector": context["selector"],
+            "current_name": context.get("current_name"),
+            "current": ranking["current"],
+            "recommended": ranking["recommended"],
+            "best": ranking["best"],
+            "nodes": sorted(
+                results,
+                key=lambda item: (
+                    item["median_ms"] is None,
+                    item["median_ms"] if item["median_ms"] is not None else 10**9,
+                ),
+            ),
+        }
+    except (OSError, ValueError, KeyError, json.JSONDecodeError, socket.timeout) as exc:
+        return {"available": False, "updated": updated, "error": f"GPT 节点测速失败: {exc}"}
+
+
+def switch_gpt_node(name: str, socket_path: str = MIHOMO_SOCKET) -> dict[str, Any]:
+    """仅在明确按钮操作后切换；目标必须仍是当前非香港候选节点。"""
+    proxies_payload = _unix_http_json(socket_path, "/proxies", timeout=0.5)
+    context = resolve_gpt_proxy_context(proxies_payload)
+    target = name
+    if not context.get("available") or target not in context.get("candidates", []):
+        return {"ok": False, "error": "目标节点不可用或已被排除"}
+    selector = context["selector"]
+    path = "/proxies/" + urllib.parse.quote(selector, safe="")
+    status, _ = _unix_http_request(
+        socket_path,
+        path,
+        timeout=1.0,
+        method="PUT",
+        payload={"name": target},
+    )
+    return {"ok": status in (200, 204), "selector": selector, "name": target}
+
+
 def read_proxy_state(
     socket_path: str = MIHOMO_SOCKET,
     app_paths: tuple[str, ...] = CLASH_APP_PATHS,
@@ -350,8 +528,19 @@ def collect(log_path: str = LOG_PATH, now: float | None = None) -> dict[str, Any
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--log-path", default=LOG_PATH)
+    parser.add_argument("--probe-gpt-nodes", action="store_true")
+    parser.add_argument("--switch-node")
     args = parser.parse_args()
-    print(json.dumps(collect(args.log_path), ensure_ascii=False))
+    if args.switch_node:
+        try:
+            result = switch_gpt_node(args.switch_node)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError, socket.timeout) as exc:
+            result = {"ok": False, "error": f"切换失败: {exc}"}
+    elif args.probe_gpt_nodes:
+        result = probe_gpt_nodes()
+    else:
+        result = collect(args.log_path)
+    print(json.dumps(result, ensure_ascii=False))
 
 
 if __name__ == "__main__":

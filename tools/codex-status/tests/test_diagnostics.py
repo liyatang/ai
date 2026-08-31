@@ -3,11 +3,12 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from diagnostics import TARGET_CLIENT, TARGET_OUTPUT, TARGET_RETRY, TARGET_WEBSOCKET, _decode_chunked, analyze_codex_rows, evaluate_tun, read_codex_activity, read_proxy_state, read_tun_state, resolve_proxy_state  # noqa: E402
+from diagnostics import TARGET_CLIENT, TARGET_OUTPUT, TARGET_RETRY, TARGET_WEBSOCKET, _decode_chunked, analyze_codex_rows, choose_gpt_recommendation, evaluate_tun, read_codex_activity, read_proxy_state, read_tun_state, resolve_gpt_proxy_context, resolve_proxy_state, switch_gpt_node  # noqa: E402
 
 TURN_A = "01a00000-0000-7000-8000-000000000001"
 TURN_B = "01a00000-0000-7000-8000-000000000002"
@@ -160,6 +161,65 @@ class DiagnosticsTests(unittest.TestCase):
         result = resolve_proxy_state({"proxies": proxies}, {"connections": []})
         self.assertEqual(result["name"], "🇯🇵 日本 AI")
         self.assertEqual(result["source"], "policy")
+
+    def test_gpt_context_uses_deep_selector_and_excludes_hong_kong(self):
+        proxies = {
+            "🤖 AI": {"type": "Selector", "now": "🔰 手动选择", "all": ["🔰 手动选择"]},
+            "🔰 手动选择": {
+                "type": "Selector",
+                "now": "🇺🇸 美国 AI",
+                "all": ["♻️ 自动选择", "🎯 Direct", "🇭🇰 香港 01", "🇸🇬 新加坡 01", "🇺🇸 美国 AI"],
+            },
+            "♻️ 自动选择": {"type": "URLTest", "now": "🇸🇬 新加坡 01", "all": ["🇸🇬 新加坡 01"]},
+            "🎯 Direct": {"type": "Direct"},
+            "🇭🇰 香港 01": {"type": "Vless"},
+            "🇸🇬 新加坡 01": {"type": "Vless"},
+            "🇺🇸 美国 AI": {"type": "Vless"},
+        }
+        result = resolve_gpt_proxy_context({"proxies": proxies})
+        self.assertTrue(result["available"])
+        self.assertEqual(result["selector"], "🔰 手动选择")
+        self.assertEqual(result["current_name"], "🇺🇸 美国 AI")
+        self.assertEqual(result["candidates"], ["🇸🇬 新加坡 01", "🇺🇸 美国 AI"])
+
+    def test_gpt_recommendation_requires_meaningful_gain(self):
+        results = [
+            {"name": "🇸🇬 新加坡 01", "median_ms": 130, "max_ms": 150},
+            {"name": "🇯🇵 日本 01", "median_ms": 170, "max_ms": 180},
+            {"name": "🇺🇸 美国 AI", "median_ms": 1200, "max_ms": 3000},
+        ]
+        picked = choose_gpt_recommendation("🇺🇸 美国 AI", results)
+        self.assertEqual(picked["recommended"]["name"], "🇸🇬 新加坡 01")
+
+        close = choose_gpt_recommendation("🇯🇵 日本 01", results[:2])
+        self.assertIsNone(close["recommended"])
+
+    @mock.patch("diagnostics._unix_http_request")
+    @mock.patch("diagnostics._unix_http_json")
+    def test_switch_gpt_node_targets_resolved_selector(self, read_json, request):
+        read_json.return_value = {"proxies": {
+            "🤖 AI": {"type": "Selector", "now": "🔰 手动选择", "all": ["🔰 手动选择"]},
+            "🔰 手动选择": {
+                "type": "Selector",
+                "now": "🇺🇸 美国 AI",
+                "all": ["🇭🇰 香港 01", "🇸🇬 新加坡 01", "🇺🇸 美国 AI"],
+            },
+            "🇭🇰 香港 01": {"type": "Vless"},
+            "🇸🇬 新加坡 01": {"type": "Vless"},
+            "🇺🇸 美国 AI": {"type": "Vless"},
+        }}
+        request.return_value = (204, b"")
+
+        result = switch_gpt_node("🇸🇬 新加坡 01", "/tmp/test.sock")
+
+        self.assertTrue(result["ok"])
+        request.assert_called_once_with(
+            "/tmp/test.sock",
+            "/proxies/%F0%9F%94%B0%20%E6%89%8B%E5%8A%A8%E9%80%89%E6%8B%A9",
+            timeout=1.0,
+            method="PUT",
+            payload={"name": "🇸🇬 新加坡 01"},
+        )
 
     def test_decodes_chunked_mihomo_response(self):
         self.assertEqual(_decode_chunked(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n"), b"Wikipedia")

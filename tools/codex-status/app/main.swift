@@ -61,6 +61,31 @@ struct DiagnosticsData: Codable {
     let codex: CodexActivity
 }
 
+struct GPTNodeResult: Codable {
+    let name: String
+    let median_ms: Int?
+    let min_ms: Int?
+    let max_ms: Int?
+    let success_count: Int?
+    let sample_count: Int?
+}
+
+struct GPTNodeBenchmark: Codable {
+    let available: Bool
+    let updated: Int?
+    let current_name: String?
+    let current: GPTNodeResult?
+    let recommended: GPTNodeResult?
+    let best: GPTNodeResult?
+    let error: String?
+}
+
+struct GPTNodeSwitchResult: Codable {
+    let ok: Bool
+    let name: String?
+    let error: String?
+}
+
 // MARK: - 数据抓取（复用 python 脚本，含缓存与错误兜底）
 
 func pythonURL() -> URL {
@@ -98,6 +123,30 @@ func fetchDiagnostics() -> DiagnosticsData? {
     p.waitUntilExit()
     guard p.terminationStatus == 0 else { return nil }
     return try? JSONDecoder().decode(DiagnosticsData.self, from: data)
+}
+
+func runDiagnosticsScript(arguments: [String]) -> Data? {
+    let script = NSHomeDirectory() + "/.config/quota-widget/diagnostics.py"
+    let process = Process()
+    process.executableURL = pythonURL()
+    process.arguments = [script] + arguments
+    process.standardError = FileHandle.nullDevice
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    do { try process.run() } catch { return nil }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return process.terminationStatus == 0 ? data : nil
+}
+
+func fetchGPTNodeBenchmark() -> GPTNodeBenchmark? {
+    guard let data = runDiagnosticsScript(arguments: ["--probe-gpt-nodes"]) else { return nil }
+    return try? JSONDecoder().decode(GPTNodeBenchmark.self, from: data)
+}
+
+func switchGPTNode(_ name: String) -> GPTNodeSwitchResult? {
+    guard let data = runDiagnosticsScript(arguments: ["--switch-node", name]) else { return nil }
+    return try? JSONDecoder().decode(GPTNodeSwitchResult.self, from: data)
 }
 
 // MARK: - 系统采样（CPU/内存/网络，本地 syscall，按采样间隔差分）
@@ -291,6 +340,10 @@ final class NetworkHistory {
         )
     }
 
+    func reset() {
+        samples.removeAll()
+    }
+
     private func percentile(_ values: [Double], _ fraction: Double) -> Double? {
         guard !values.isEmpty else { return nil }
         let index = min(values.count - 1, max(0, Int((Double(values.count - 1) * fraction).rounded())))
@@ -423,6 +476,10 @@ func attrString(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular,
 
 // MARK: - 卡片视图（自绘）
 
+final class FirstMouseButton: NSButton {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 class CardView: NSView {
     var data: QuotaData? {
         didSet { needsDisplay = true }
@@ -439,6 +496,16 @@ class CardView: NSView {
     var network: NetworkHealth? {
         didSet { needsDisplay = true }
     }
+    var gptNodes: GPTNodeBenchmark? {
+        didSet {
+            needsDisplay = true
+            if let window { window.invalidateCursorRects(for: self) }
+        }
+    }
+    var switchStatus: String? {
+        didSet { needsDisplay = true }
+    }
+    var onSwitchRecommended: ((String) -> Void)?
 
     let cardWidth: CGFloat = 330
     private let padX: CGFloat = 18
@@ -448,6 +515,33 @@ class CardView: NSView {
     private var networkRateSamples: [(down: Double, up: Double)] = []
     private let latencyWindow: TimeInterval = 180
     private var latencySamples: [(at: Date, latencyMs: Double?, ok: Bool)] = []
+    private lazy var switchButton: FirstMouseButton = {
+        let button = FirstMouseButton(title: "切换", target: self, action: #selector(handleSwitchButton))
+        button.bezelStyle = .regularSquare
+        button.isBordered = false
+        button.focusRingType = .none
+        button.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        button.contentTintColor = greenColor
+        button.toolTip = "切换到建议节点，并重新测试 GPT 连接"
+        button.setAccessibilityLabel("切换到建议的 GPT 节点")
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 6
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = greenColor.withAlphaComponent(0.72).cgColor
+        button.layer?.backgroundColor = greenColor.withAlphaComponent(0.16).cgColor
+        button.isHidden = true
+        return button
+    }()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        addSubview(switchButton)
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        addSubview(switchButton)
+    }
 
     override var isFlipped: Bool { true }
 
@@ -458,6 +552,7 @@ class CardView: NSView {
         case win(QuotaWindow)
         case error(String)
         case metric(String, String, NSColor) // 名称, 值, 状态色
+        case recommendation(String, String, Bool) // 节点, GPT 延迟/状态, 是否可切换
         case latencyChart                    // 连接诊断：ChatGPT 延迟趋势
         case diagnosis(String, String, NSColor)
         case sysBar(String, String, Int)    // 名称, 说明, 百分比（带进度条）
@@ -513,6 +608,9 @@ class CardView: NSView {
                 networkValue = "\(median) ms · \(n.sampleCount)样本"
             }
             networkColor = n.isSlow ? redColor : (n.isHealthy ? greenColor : orangeColor)
+        } else if let current = gptNodes?.current, let latency = current.median_ms {
+            networkValue = "\(latency) ms · \(current.success_count ?? 0)样本"
+            networkColor = latency < 1000 ? greenColor : (latency < 2000 ? orangeColor : redColor)
         } else {
             networkValue = "检测中…"
             networkColor = dimColor
@@ -520,7 +618,10 @@ class CardView: NSView {
 
         let proxyValue: String
         let proxyColor: NSColor
-        if let proxy = diagnostics?.proxy, proxy.available, let name = proxy.name, !name.isEmpty {
+        if let name = gptNodes?.current_name, !name.isEmpty {
+            proxyValue = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            proxyColor = greenColor
+        } else if let proxy = diagnostics?.proxy, proxy.available, let name = proxy.name, !name.isEmpty {
             proxyValue = name.trimmingCharacters(in: .whitespacesAndNewlines)
             proxyColor = greenColor
         } else if tun?.state == "unavailable",
@@ -555,12 +656,42 @@ class CardView: NSView {
             codexColor = orangeColor
         }
 
+        let recommendation: Item
+        if let status = switchStatus {
+            recommendation = .recommendation(
+                gptNodes?.recommended?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? "建议节点",
+                status,
+                false
+            )
+        } else if let nodes = gptNodes, nodes.available {
+            if let suggested = nodes.recommended, let latency = suggested.median_ms {
+                recommendation = .recommendation(
+                    suggested.name.trimmingCharacters(in: .whitespacesAndNewlines),
+                    String(format: "GPT %d ms · %d样本", latency, suggested.success_count ?? 0),
+                    true
+                )
+            } else if let current = nodes.current, let latency = current.median_ms {
+                recommendation = .recommendation(
+                    "当前节点已较优",
+                    String(format: "GPT %d ms", latency),
+                    false
+                )
+            } else {
+                recommendation = .recommendation("暂无建议", "GPT 节点测速无有效样本", false)
+            }
+        } else if let error = gptNodes?.error {
+            recommendation = .recommendation("测速不可用", error, false)
+        } else {
+            recommendation = .recommendation("正在比较节点…", "仅测试 GPT 连接，不切换", false)
+        }
+
         var items: [Item] = [
             .divider,
             .title("连接诊断", nil, false),
             .metric("TUN", tunValue, tunColor),
-            .metric("代理", proxyValue, proxyColor),
-            .metric("网络", networkValue, networkColor),
+            .metric("当前节点", proxyValue, proxyColor),
+            .metric("GPT 连接", networkValue, networkColor),
+            recommendation,
             .latencyChart,
         ]
         if codex?.available == false {
@@ -656,6 +787,12 @@ class CardView: NSView {
         if latencySamples.count > 120 {
             latencySamples.removeFirst(latencySamples.count - 120)
         }
+        needsDisplay = true
+    }
+
+    func clearLatencySamples() {
+        latencySamples.removeAll()
+        network = nil
         needsDisplay = true
     }
 
@@ -864,6 +1001,7 @@ class CardView: NSView {
         case .win: return 34
         case .error: return 22
         case .metric: return 24
+        case .recommendation: return 40
         case .latencyChart: return 71
         case .diagnosis: return 36
         case .sysBar: return 34
@@ -904,6 +1042,7 @@ class CardView: NSView {
         }()
         let contentW = cardWidth - padX * 2
         var y = padTop
+        switchButton.isHidden = true
 
         for item in items {
             switch item {
@@ -994,6 +1133,39 @@ class CardView: NSView {
                 t.draw(at: NSPoint(x: cardWidth - padX - size.width, y: y + 4))
                 y += itemHeight(item)
 
+            case .recommendation(let name, let detail, let canSwitch):
+                attrString("建议切换", size: 12, color: faintColor)
+                    .draw(at: NSPoint(x: padX, y: y + 3))
+                let buttonWidth: CGFloat = canSwitch ? 48 : 0
+                let valueX = padX + 64
+                let valueWidth = contentW - 64 - (canSwitch ? buttonWidth + 8 : 0)
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.lineBreakMode = .byTruncatingTail
+                let node = NSAttributedString(string: name, attributes: [
+                    .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+                    .foregroundColor: canSwitch ? greenColor : faintColor,
+                    .paragraphStyle: paragraph,
+                ])
+                node.draw(in: NSRect(x: valueX, y: y + 2, width: valueWidth, height: 17))
+                let detailText = NSAttributedString(string: detail, attributes: [
+                    .font: NSFont.systemFont(ofSize: 10),
+                    .foregroundColor: dimColor,
+                    .paragraphStyle: paragraph,
+                ])
+                detailText.draw(in: NSRect(x: valueX, y: y + 20, width: valueWidth, height: 15))
+                if canSwitch {
+                    let rect = NSRect(
+                        x: cardWidth - padX - buttonWidth,
+                        y: y + 5,
+                        width: buttonWidth,
+                        height: 25
+                    )
+                    switchButton.frame = rect
+                    switchButton.isEnabled = true
+                    switchButton.isHidden = false
+                }
+                y += itemHeight(item)
+
             case .latencyChart:
                 drawLatencyChart(at: y, width: contentW)
                 y += itemHeight(item)
@@ -1042,12 +1214,17 @@ class CardView: NSView {
             }
         }
     }
+
+    @objc private func handleSwitchButton() {
+        guard let target = gptNodes?.recommended?.name else { return }
+        onSwitchRecommended?(target)
+    }
 }
 
 // MARK: - 窗口与应用
 
 class WidgetPanel: NSPanel {
-    override var canBecomeKey: Bool { false }
+    override var canBecomeKey: Bool { true }
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -1057,11 +1234,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var tickTimer: Timer?
     private var sysTimer: Timer?
     private var diagnosticsTimer: Timer?
+    private var nodeBenchmarkTimer: Timer?
     private let sampler = SysSampler()
     private let networkHistory = NetworkHistory()
     private let networkProbe = NetworkProbe()
     private var lastProbeAt = Date.distantPast
     private var diagnosticsRefreshInFlight = false
+    private var nodeBenchmarkRefreshInFlight = false
+    private var nodeSwitchInFlight = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
         // 单实例：已有同名 app 在跑就退出（避免 open 重复拉起叠两张卡）
@@ -1086,19 +1266,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hidesOnDeactivate = false   // NSPanel 默认随 App 失活隐藏；accessory app 永不 active，必须关掉
+        panel.becomesKeyOnlyIfNeeded = true
         panel.level = level
         switch env["AQUOTA_SPACE_MODE"] {
         case "default": panel.collectionBehavior = []
         case "all": panel.collectionBehavior = [.canJoinAllSpaces]
         default: panel.collectionBehavior = [.canJoinAllSpaces, .stationary]
         }
-        panel.ignoresMouseEvents = true
+        panel.ignoresMouseEvents = false
         panel.hasShadow = true
         panel.contentView = card
+        card.onSwitchRecommended = { [weak self] name in
+            self?.switchRecommendedNode(name)
+        }
         position()
         panel.orderFrontRegardless()
         refresh()
         refreshDiagnostics()
+        refreshGPTNodeBenchmark()
 
         sampleSys()   // 建立首个基线（CPU/网速等下次采样才有差分值）
         sysTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
@@ -1110,6 +1295,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         diagnosticsTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             self?.refreshDiagnostics()
+        }
+        nodeBenchmarkTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in
+            self?.refreshGPTNodeBenchmark()
         }
         // 定期重绘，保持"今天/明天"等日期标签在跨天时正确
         tickTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
@@ -1193,6 +1381,56 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self.position()
         }) else { return }
         lastProbeAt = now
+    }
+
+    /// 节点测速使用 mihomo 的指定节点 URL 探针，不改变当前 Selector。
+    func refreshGPTNodeBenchmark() {
+        guard !nodeBenchmarkRefreshInFlight, !nodeSwitchInFlight else { return }
+        nodeBenchmarkRefreshInFlight = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = fetchGPTNodeBenchmark()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.nodeBenchmarkRefreshInFlight = false
+                if let result {
+                    self.card.gptNodes = result
+                    if self.card.switchStatus == "已切换，重新测速…" {
+                        self.card.switchStatus = nil
+                    }
+                }
+                self.position()
+            }
+        }
+    }
+
+    /// 只有用户点击“切换”后才修改 mihomo Selector；失败时保留原节点。
+    func switchRecommendedNode(_ name: String) {
+        guard !nodeSwitchInFlight else { return }
+        nodeSwitchInFlight = true
+        card.switchStatus = "切换中…"
+        position()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = switchGPTNode(name)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.nodeSwitchInFlight = false
+                if result?.ok == true {
+                    self.card.switchStatus = "已切换，重新测速…"
+                    self.networkHistory.reset()
+                    self.card.clearLatencySamples()
+                    self.lastProbeAt = .distantPast
+                    self.refreshDiagnostics()
+                    self.refreshGPTNodeBenchmark()
+                } else {
+                    self.card.switchStatus = result?.error ?? "切换失败"
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+                        self?.card.switchStatus = nil
+                        self?.position()
+                    }
+                }
+                self.position()
+            }
+        }
     }
 
     /// 本地采样 CPU/内存/网络并刷新卡片；高度变化（系统区块首次出现）时重新锚定
