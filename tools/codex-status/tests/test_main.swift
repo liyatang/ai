@@ -97,4 +97,8 @@ let oldBenchmarkToken = gate.current
 _ = gate.invalidate()
 require(!gate.accepts(oldBenchmarkToken), "切换后必须丢弃切换前仍在执行的测速结果")
 require(gate.accepts(gate.current), "当前代测速结果应被接受")
+require(
+    latestDisplayUpdated(quota: 100, diagnostics: 200) == 200,
+    "更新时间应展示较新的连接诊断时间"
+)
 print("Swift card state tests passed")

@@ -26,7 +26,6 @@ from typing import Any
 
 LOG_PATH = os.path.expanduser("~/.codex/logs_2.sqlite")
 QUALITY_PATH = os.path.expanduser("~/.config/quota-widget/gpt_node_quality.json")
-SWITCH_AUDIT_PATH = os.path.expanduser("~/.config/quota-widget/switch_audit.jsonl")
 MIHOMO_SOCKET = "/tmp/verge/verge-mihomo.sock"
 CLASH_APP_PATHS = (
     "/Applications/Clash Verge.app",
@@ -498,6 +497,7 @@ def load_quality_history(
         payload.setdefault("created_at", current)
         payload.setdefault("turns", {})
         payload.setdefault("switches", [])
+        payload.setdefault("selected_node", None)
         return payload
     except (OSError, ValueError, json.JSONDecodeError):
         return {
@@ -506,6 +506,7 @@ def load_quality_history(
             "updated": current,
             "turns": {},
             "switches": [],
+            "selected_node": None,
         }
 
 
@@ -540,72 +541,18 @@ def save_quality_history(history: dict[str, Any], path: str = QUALITY_PATH) -> N
         raise
 
 
-def record_node_switch(
-    previous: str | None,
-    target: str,
-    at: float | None = None,
-    path: str = QUALITY_PATH,
-) -> None:
-    changed_at = time.time() if at is None else at
-    with quality_history_lock(path):
-        history = load_quality_history(path, changed_at)
-        history["switches"] = [
-            item for item in history.get("switches", [])
-            if changed_at - float(item.get("at") or 0) <= QUALITY_WINDOW_SECONDS
-        ]
-        history["switches"].append({"at": changed_at, "from": previous, "to": target})
-        history["updated"] = changed_at
-        save_quality_history(history, path)
-
-
-def record_switch_audit(
-    entry: dict[str, Any], path: str = SWITCH_AUDIT_PATH, limit: int = 100
-) -> None:
-    """原子保存最近的本地切换结果，不包含请求内容或认证信息。"""
-    directory = os.path.dirname(path)
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    lock_descriptor = os.open(f"{path}.lock", os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-        lines: list[str] = []
-        try:
-            with open(path, encoding="utf-8") as file:
-                lines = file.read().splitlines()[-max(0, limit - 1):]
-        except OSError:
-            pass
-        lines.append(json.dumps(entry, ensure_ascii=False, separators=(",", ":")))
-        temporary = f"{path}.tmp-{os.getpid()}"
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as file:
-                file.write("\n".join(lines) + "\n")
-            os.replace(temporary, path)
-            os.chmod(path, 0o600)
-        except BaseException:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-            raise
-    finally:
-        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
-        os.close(lock_descriptor)
-
-
 def _node_for_turn(
     start_at: float, current_name: str, switches: list[dict[str, Any]]
 ) -> str:
     ordered = sorted(switches, key=lambda item: float(item.get("at") or 0))
-    node = current_name
     for item in ordered:
         switched_at = float(item.get("at") or 0)
         if start_at < switched_at:
             previous = item.get("from")
-            return str(previous) if previous else node
-        target = item.get("to")
-        if target:
-            node = str(target)
-    return node
+            return str(previous).strip() if previous else current_name.strip()
+    # 没有发生在该轮次之后的切换时，以当前实际 Selector 为准。
+    # 旧实现会重放历史 target，导致 Clash 中手动切换后，新轮次仍归到旧节点。
+    return current_name.strip()
 
 
 def update_quality_history(
@@ -620,18 +567,36 @@ def update_quality_history(
         item for item in history.get("switches", [])
         if float(item.get("at") or 0) >= cutoff
     ]
+    current_node = current_name.strip() if current_name else None
+    observed_node = history.get("selected_node")
+    observed_node = str(observed_node).strip() if observed_node else None
+    if observed_node is None and switches:
+        latest_switch = max(switches, key=lambda item: float(item.get("at") or 0))
+        latest_target = latest_switch.get("to")
+        observed_node = str(latest_target).strip() if latest_target else None
+    if current_node and observed_node and current_node != observed_node:
+        # Clash UI / 其他客户端也可以改变 Selector。首次观察到变化时补记切换，
+        # 让正在跨越切换点的会话进入 grace，而后续会话归到当前实际节点。
+        switches.append({
+            "at": now,
+            "from": observed_node,
+            "to": current_node,
+            "source": "observed",
+        })
     stored = {
         turn_id: item for turn_id, item in (history.get("turns") or {}).items()
         if float((item or {}).get("last_seen_at") or 0) >= cutoff
     }
-    if current_name:
+    if current_node:
         for turn in turns:
             turn_id = str(turn.get("turn_id") or "")
             start_at = float(turn.get("start_at") or 0)
             if not turn_id or start_at < created_at or start_at < cutoff:
                 continue
             previous = stored.get(turn_id) or {}
-            node = str(previous.get("node") or _node_for_turn(start_at, current_name, switches))
+            node = str(
+                previous.get("node") or _node_for_turn(start_at, current_node, switches)
+            ).strip()
             last_seen_at = float(turn.get("last_seen_at") or start_at)
             overlaps_switch = any(
                 start_at <= float(item.get("at") or 0) + SWITCH_GRACE_SECONDS
@@ -655,6 +620,10 @@ def update_quality_history(
         "updated": now,
         "turns": stored,
         "switches": switches,
+        "selected_node": current_node,
+        "selected_node_observed_at": now if current_node else history.get(
+            "selected_node_observed_at"
+        ),
     })
     return history
 
@@ -663,9 +632,10 @@ def summarize_node_quality(
     history: dict[str, Any], node: str, now: float | None = None
 ) -> dict[str, Any]:
     current = time.time() if now is None else now
+    normalized_node = node.strip()
     records = [
         item for item in (history.get("turns") or {}).values()
-        if (item or {}).get("node") == node
+        if str((item or {}).get("node") or "").strip() == normalized_node
         and not (item or {}).get("ignored_after_switch")
         and current - float((item or {}).get("start_at") or 0) <= QUALITY_WINDOW_SECONDS
         and (
@@ -720,7 +690,7 @@ def summarize_node_quality(
         status = "observing"
     confidence = "high" if turn_count >= 20 else ("medium" if turn_count >= 10 else "low")
     return {
-        "node": node,
+        "node": normalized_node,
         "status": status,
         "confidence": confidence,
         "turn_count": turn_count,
@@ -742,7 +712,7 @@ def all_node_qualities(
     history: dict[str, Any], now: float | None = None
 ) -> dict[str, dict[str, Any]]:
     nodes = {
-        str(item.get("node")) for item in (history.get("turns") or {}).values()
+        str(item.get("node")).strip() for item in (history.get("turns") or {}).values()
         if (item or {}).get("node")
     }
     return {node: summarize_node_quality(history, node, now) for node in nodes}
@@ -768,7 +738,10 @@ def choose_gpt_recommendation(
     best = successful[0] if successful else None
     recommended = None
     trial = None
-    current_quality = qualities.get(current_name or "") or {
+    def node_quality(name: Any) -> dict[str, Any] | None:
+        return qualities.get(str(name or "").strip())
+
+    current_quality = node_quality(current_name) or {
         "node": current_name,
         "status": "observing",
         "confidence": "low",
@@ -783,10 +756,10 @@ def choose_gpt_recommendation(
         stable_candidates = [
             item for item in successful
             if item.get("name") != current_name
-            and (qualities.get(str(item.get("name"))) or {}).get("status") == "stable"
+            and (node_quality(item.get("name")) or {}).get("status") == "stable"
         ]
         stable_candidates.sort(key=lambda item: (
-            -(qualities[str(item["name"])].get("first_attempt_success_pct") or 0),
+            -((node_quality(item["name"]) or {}).get("first_attempt_success_pct") or 0),
             item.get("p90_ms") or 10**9,
             item.get("median_ms") or 10**9,
         ))
@@ -795,7 +768,7 @@ def choose_gpt_recommendation(
             trial = next(
                 (item for item in successful
                  if item.get("name") != current_name
-                 and (qualities.get(str(item.get("name"))) or {}).get("status") != "unstable"),
+                 and (node_quality(item.get("name")) or {}).get("status") != "unstable"),
                 None,
             )
     return {
@@ -857,8 +830,9 @@ def probe_gpt_nodes(socket_path: str = MIHOMO_SOCKET) -> dict[str, Any]:
         history = load_quality_history()
         qualities = all_node_qualities(history, updated)
         for item in results:
-            item["quality"] = qualities.get(item["name"]) or summarize_node_quality(
-                history, item["name"], updated
+            normalized_name = str(item["name"]).strip()
+            item["quality"] = qualities.get(normalized_name) or summarize_node_quality(
+                history, normalized_name, updated
             )
         ranking = choose_gpt_recommendation(context.get("current_name"), results, qualities)
         return {
@@ -883,65 +857,6 @@ def probe_gpt_nodes(socket_path: str = MIHOMO_SOCKET) -> dict[str, Any]:
         }
     except (OSError, ValueError, KeyError, json.JSONDecodeError, socket.timeout) as exc:
         return {"available": False, "updated": updated, "error": f"GPT 节点测速失败: {exc}"}
-
-
-def switch_gpt_node(
-    name: str,
-    socket_path: str = MIHOMO_SOCKET,
-    quality_path: str | None = QUALITY_PATH,
-    audit_path: str | None = SWITCH_AUDIT_PATH,
-) -> dict[str, Any]:
-    """仅在明确按钮操作后切换，并回读 selector 确认实际结果。"""
-    proxies_payload = _unix_http_json(socket_path, "/proxies", timeout=0.5)
-    context = resolve_gpt_proxy_context(proxies_payload)
-    target = name
-    previous = context.get("current_name")
-    if not context.get("available") or target not in context.get("candidates", []):
-        result = {
-            "ok": False,
-            "name": target,
-            "previous_name": previous,
-            "actual_name": previous,
-            "error": "目标节点不可用或已被排除",
-        }
-        if audit_path:
-            record_switch_audit({"at": int(time.time()), **result}, path=audit_path)
-        return result
-    selector = context["selector"]
-    path = "/proxies/" + urllib.parse.quote(selector, safe="")
-    status, _ = _unix_http_request(
-        socket_path,
-        path,
-        timeout=1.0,
-        method="PUT",
-        payload={"name": target},
-    )
-    accepted = status in (200, 204)
-    actual = None
-    error = None
-    if accepted:
-        try:
-            confirmed_payload = _unix_http_json(socket_path, "/proxies", timeout=0.5)
-            confirmed = resolve_gpt_proxy_context(confirmed_payload)
-            actual = confirmed.get("current_name")
-        except (OSError, ValueError, KeyError, json.JSONDecodeError, socket.timeout):
-            error = "切换请求已发送，但无法回读确认"
-    ok = accepted and actual == target
-    if accepted and actual is not None and actual != target:
-        error = f"selector 实际仍为 {str(actual).strip()}"
-    if ok and quality_path and previous != target:
-        record_node_switch(previous, target, path=quality_path)
-    result = {
-        "ok": ok,
-        "selector": selector,
-        "name": target,
-        "previous_name": previous,
-        "actual_name": actual,
-        **({"error": error or "切换未确认"} if not ok else {}),
-    }
-    if audit_path:
-        record_switch_audit({"at": int(time.time()), **result}, path=audit_path)
-    return result
 
 
 def read_proxy_state(
@@ -976,6 +891,7 @@ def collect(log_path: str = LOG_PATH, now: float | None = None) -> dict[str, Any
     quality = None
     quality_node = proxy.get("selected_name") or proxy.get("name")
     if proxy.get("available") and quality_node:
+        quality_node = str(quality_node).strip()
         try:
             with quality_history_lock():
                 history = load_quality_history(now=current)
@@ -997,14 +913,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--log-path", default=LOG_PATH)
     parser.add_argument("--probe-gpt-nodes", action="store_true")
-    parser.add_argument("--switch-node")
     args = parser.parse_args()
-    if args.switch_node:
-        try:
-            result = switch_gpt_node(args.switch_node)
-        except (OSError, ValueError, KeyError, json.JSONDecodeError, socket.timeout) as exc:
-            result = {"ok": False, "error": f"切换失败: {exc}"}
-    elif args.probe_gpt_nodes:
+    if args.probe_gpt_nodes:
         result = probe_gpt_nodes()
     else:
         result = collect(args.log_path)

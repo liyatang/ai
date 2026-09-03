@@ -151,19 +151,15 @@ struct GPTNodeBenchmark: Codable {
     let error: String?
 }
 
-struct GPTNodeSwitchResult: Codable {
-    let ok: Bool
-    let name: String?
-    let previous_name: String?
-    let actual_name: String?
-    let error: String?
-}
-
 func normalizedNodeName(_ name: String?) -> String? {
     guard let value = name?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
         return nil
     }
     return value
+}
+
+func latestDisplayUpdated(quota: Int?, diagnostics: Int?) -> Int? {
+    [quota, diagnostics].compactMap { $0 }.max()
 }
 
 func matchingQuality(
@@ -264,11 +260,6 @@ func runDiagnosticsScript(arguments: [String]) -> Data? {
 func fetchGPTNodeBenchmark() -> GPTNodeBenchmark? {
     guard let data = runDiagnosticsScript(arguments: ["--probe-gpt-nodes"]) else { return nil }
     return try? JSONDecoder().decode(GPTNodeBenchmark.self, from: data)
-}
-
-func switchGPTNode(_ name: String) -> GPTNodeSwitchResult? {
-    guard let data = runDiagnosticsScript(arguments: ["--switch-node", name]) else { return nil }
-    return try? JSONDecoder().decode(GPTNodeSwitchResult.self, from: data)
 }
 
 // MARK: - 系统采样（CPU/内存/网络，本地 syscall，按采样间隔差分）
@@ -593,10 +584,6 @@ func attrString(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular,
 
 // MARK: - 卡片视图（自绘）
 
-final class FirstMouseButton: NSButton {
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-}
-
 class CardView: NSView {
     var data: QuotaData? {
         didSet { needsDisplay = true }
@@ -619,15 +606,6 @@ class CardView: NSView {
             if let window { window.invalidateCursorRects(for: self) }
         }
     }
-    var switchStatus: String? {
-        didSet { needsDisplay = true }
-    }
-    var switchTarget: String? {
-        didSet { needsDisplay = true }
-    }
-    var switchError: String? {
-        didSet { needsDisplay = true }
-    }
     var quotaStale = false {
         didSet { needsDisplay = true }
     }
@@ -637,8 +615,6 @@ class CardView: NSView {
     var benchmarkError: String? {
         didSet { needsDisplay = true }
     }
-    var onSwitchRecommended: ((String) -> Void)?
-
     let cardWidth: CGFloat = 330
     private let padX: CGFloat = 18
     private let padTop: CGFloat = 14
@@ -647,34 +623,6 @@ class CardView: NSView {
     private var networkRateSamples: [(down: Double, up: Double)] = []
     private let latencyWindow: TimeInterval = 180
     private var latencySamples: [(at: Date, latencyMs: Double?, ok: Bool)] = []
-    private lazy var switchButton: FirstMouseButton = {
-        let button = FirstMouseButton(title: "切换", target: self, action: #selector(handleSwitchButton))
-        button.bezelStyle = .regularSquare
-        button.isBordered = false
-        button.focusRingType = .none
-        button.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
-        button.contentTintColor = greenColor
-        button.toolTip = "切换到建议节点，并重新测试 GPT 连接"
-        button.setAccessibilityLabel("切换到建议的 GPT 节点")
-        button.wantsLayer = true
-        button.layer?.cornerRadius = 6
-        button.layer?.borderWidth = 1
-        button.layer?.borderColor = greenColor.withAlphaComponent(0.72).cgColor
-        button.layer?.backgroundColor = greenColor.withAlphaComponent(0.16).cgColor
-        button.isHidden = true
-        return button
-    }()
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        addSubview(switchButton)
-    }
-
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        addSubview(switchButton)
-    }
-
     override var isFlipped: Bool { true }
 
     override func isAccessibilityElement() -> Bool { true }
@@ -685,8 +633,7 @@ class CardView: NSView {
         if let window = data?.gpt?.windows?.first {
             parts.append("GPT \(window.id)剩余\(max(0, 100 - (window.used_pct ?? 0)))%")
         }
-        let selected = normalizedNodeName(switchTarget)
-            ?? normalizedNodeName(diagnostics?.proxy?.selected_name)
+        let selected = normalizedNodeName(diagnostics?.proxy?.selected_name)
             ?? normalizedNodeName(gptNodes?.current_name)
             ?? normalizedNodeName(diagnostics?.proxy?.name)
         if let selected { parts.append("节点\(selected)") }
@@ -709,7 +656,7 @@ class CardView: NSView {
         case win(QuotaWindow)
         case error(String)
         case summary(String, String, NSColor, String?, NSColor?) // 名称, 主摘要, 主色, 次摘要, 次色
-        case recommendation(String, String, String, String?) // 标签, 节点, 状态, 按钮标题
+        case recommendation(String, String, String) // 标签, 节点, 状态
         case latencyChart                    // 连接诊断：ChatGPT 延迟趋势
         case sysNet(String)                 // 右侧"↓ ↓"速度文本
         case netChart                       // 系统区：下载/上传趋势
@@ -774,8 +721,7 @@ class CardView: NSView {
             networkColor = dimColor
         }
 
-        let selectedNode = normalizedNodeName(switchTarget)
-            ?? normalizedNodeName(diagnostics?.proxy?.selected_name)
+        let selectedNode = normalizedNodeName(diagnostics?.proxy?.selected_name)
             ?? normalizedNodeName(gptNodes?.current_name)
             ?? normalizedNodeName(diagnostics?.proxy?.name)
         let activeNode = normalizedNodeName(diagnostics?.proxy?.active_name)
@@ -838,36 +784,23 @@ class CardView: NSView {
 
         var recommendation: Item?
         let currentStatus = quality?.status ?? "observing"
-        if let status = switchStatus {
-            recommendation = .recommendation(
-                "建议",
-                normalizedNodeName(switchTarget)
-                    ?? normalizedNodeName((gptNodes?.recommended ?? gptNodes?.trial)?.name)
-                    ?? "建议节点",
-                status,
-                nil
-            )
-        } else if ["unstable", "unavailable"].contains(currentStatus),
+        if ["unstable", "unavailable"].contains(currentStatus),
                   let nodes = gptNodes, nodes.available {
             if let suggested = nodes.recommended {
                 let stable = suggested.quality
                 recommendation = .recommendation(
-                    "建议切换",
+                    "建议节点",
                     suggested.name.trimmingCharacters(in: .whitespacesAndNewlines),
-                    switchError ?? "首连 \(stable?.first_attempt_success_pct ?? 0)% · \(stable?.turn_count ?? 0)轮验证",
-                    "切换"
+                    "已验证稳定 · 首连 \(stable?.first_attempt_success_pct ?? 0)% · \(stable?.turn_count ?? 0)轮"
                 )
             } else if let trial = nodes.trial {
                 recommendation = .recommendation(
-                    "候选试用",
+                    "候选节点",
                     trial.name.trimmingCharacters(in: .whitespacesAndNewlines),
-                    switchError ?? "短测 P90 \(trial.p90_ms ?? trial.median_ms ?? 0) ms · 稳定性未验证",
-                    "试用"
+                    "短测 P90 \(trial.p90_ms ?? trial.median_ms ?? 0) ms · 稳定性未验证"
                 )
             } else {
-                recommendation = switchError.map {
-                    .summary("切换失败", $0, redColor, nil, nil)
-                } ?? .summary("建议", "暂无稳定候选", faintColor, nil, nil)
+                recommendation = .summary("建议", "暂无稳定候选", faintColor, nil, nil)
             }
         } else if ["unstable", "unavailable"].contains(currentStatus),
                   gptNodes?.available == false {
@@ -876,9 +809,7 @@ class CardView: NSView {
                 benchmarkError.map { " · \($0)" }, dimColor
             )
         } else if ["unstable", "unavailable"].contains(currentStatus) {
-            recommendation = switchError.map {
-                .summary("切换失败", $0, redColor, nil, nil)
-            } ?? .summary("建议", "正在比较候选", faintColor, nil, nil)
+            recommendation = .summary("建议", "正在比较候选", faintColor, nil, nil)
         }
 
         let diagnosisResult = diagnosis(quality: quality)
@@ -1263,14 +1194,15 @@ class CardView: NSView {
         }()
         let contentW = cardWidth - padX * 2
         var y = padTop
-        switchButton.isHidden = true
-
         for item in items {
             switch item {
             case .header:
                 attrString("Codex 状态", size: 16, weight: .semibold, color: textColor)
                     .draw(at: NSPoint(x: padX, y: y + 3))
-                if let u = d.updated {
+                if let u = latestDisplayUpdated(
+                    quota: d.updated,
+                    diagnostics: diagnostics?.updated
+                ) {
                     let ts = attrString("更新 " + timeFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(u))),
                                         size: 11, color: dimColor)
                     let sz = ts.size()
@@ -1359,18 +1291,16 @@ class CardView: NSView {
                 value.draw(in: NSRect(x: padX + 54, y: y + 3, width: contentW - 54, height: 18))
                 y += itemHeight(item)
 
-            case .recommendation(let label, let name, let detail, let actionTitle):
+            case .recommendation(let label, let name, let detail):
                 attrString(label, size: 12, color: faintColor)
                     .draw(at: NSPoint(x: padX, y: y + 3))
-                let canSwitch = actionTitle != nil
-                let buttonWidth: CGFloat = canSwitch ? 48 : 0
                 let valueX = padX + 64
-                let valueWidth = contentW - 64 - (canSwitch ? buttonWidth + 8 : 0)
+                let valueWidth = contentW - 64
                 let paragraph = NSMutableParagraphStyle()
                 paragraph.lineBreakMode = .byTruncatingTail
                 let node = NSAttributedString(string: name, attributes: [
                     .font: NSFont.systemFont(ofSize: 12, weight: .medium),
-                    .foregroundColor: canSwitch ? greenColor : faintColor,
+                    .foregroundColor: greenColor,
                     .paragraphStyle: paragraph,
                 ])
                 node.draw(in: NSRect(x: valueX, y: y + 2, width: valueWidth, height: 17))
@@ -1380,24 +1310,6 @@ class CardView: NSView {
                     .paragraphStyle: paragraph,
                 ])
                 detailText.draw(in: NSRect(x: valueX, y: y + 20, width: valueWidth, height: 15))
-                if let actionTitle {
-                    switchButton.title = actionTitle
-                    switchButton.toolTip = actionTitle == "试用"
-                        ? "切换到候选节点并开始真实稳定性观察"
-                        : "切换到已验证稳定节点，并重新测试 GPT 连接"
-                    let rect = NSRect(
-                        x: cardWidth - padX - buttonWidth,
-                        y: y + 5,
-                        width: buttonWidth,
-                        height: 25
-                    )
-                    switchButton.frame = rect
-                    switchButton.setAccessibilityLabel(
-                        "\(actionTitle)到 \(name.trimmingCharacters(in: .whitespacesAndNewlines))"
-                    )
-                    switchButton.isEnabled = true
-                    switchButton.isHidden = false
-                }
                 y += itemHeight(item)
 
             case .latencyChart:
@@ -1418,10 +1330,6 @@ class CardView: NSView {
         }
     }
 
-    @objc private func handleSwitchButton() {
-        guard let target = (gptNodes?.recommended ?? gptNodes?.trial)?.name else { return }
-        onSwitchRecommended?(target)
-    }
 }
 
 // MARK: - 窗口与应用
@@ -1444,7 +1352,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastProbeAt = Date.distantPast
     private var diagnosticsRefreshInFlight = false
     private var nodeBenchmarkRefreshInFlight = false
-    private var nodeSwitchInFlight = false
     private var nodeBenchmarkGeneration = GenerationGate()
     private var nodeBenchmarkRefreshRequested = false
 
@@ -1481,9 +1388,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         panel.ignoresMouseEvents = false
         panel.hasShadow = true
         panel.contentView = card
-        card.onSwitchRecommended = { [weak self] name in
-            self?.switchRecommendedNode(name)
-        }
         let contextMenu = NSMenu()
         let refreshItem = NSMenuItem(title: "立即刷新", action: #selector(manualRefresh), keyEquivalent: "")
         refreshItem.target = self
@@ -1632,7 +1536,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             _ = nodeBenchmarkGeneration.invalidate()
             nodeBenchmarkRefreshRequested = true
         }
-        guard !nodeBenchmarkRefreshInFlight, !nodeSwitchInFlight else { return }
+        guard !nodeBenchmarkRefreshInFlight else { return }
         nodeBenchmarkRefreshRequested = false
         let generation = nodeBenchmarkGeneration.current
         nodeBenchmarkRefreshInFlight = true
@@ -1644,48 +1548,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if self.nodeBenchmarkGeneration.accepts(generation), let result {
                     self.card.gptNodes = result
                     self.card.benchmarkError = result.available ? nil : result.error
-                    if let target = normalizedNodeName(self.card.switchTarget),
-                       normalizedNodeName(result.current_name) == target {
-                        self.card.switchTarget = nil
-                        self.card.switchStatus = nil
-                        self.card.switchError = nil
-                    }
                 }
                 self.position()
                 if self.nodeBenchmarkRefreshRequested {
                     self.refreshGPTNodeBenchmark()
                 }
-            }
-        }
-    }
-
-    /// 只有用户点击“切换”后才修改 mihomo Selector；失败时保留原节点。
-    func switchRecommendedNode(_ name: String) {
-        guard !nodeSwitchInFlight else { return }
-        nodeSwitchInFlight = true
-        card.switchTarget = name
-        card.switchError = nil
-        card.switchStatus = "切换中…"
-        position()
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result = switchGPTNode(name)
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.nodeSwitchInFlight = false
-                if result?.ok == true {
-                    self.card.switchTarget = result?.actual_name ?? result?.name ?? name
-                    self.card.switchStatus = "已确认，正在验证…"
-                    self.networkHistory.reset()
-                    self.card.clearLatencySamples()
-                    self.lastProbeAt = .distantPast
-                    self.refreshDiagnostics()
-                    self.refreshGPTNodeBenchmark(force: true)
-                } else {
-                    self.card.switchTarget = nil
-                    self.card.switchStatus = nil
-                    self.card.switchError = result?.error ?? "上次切换失败"
-                }
-                self.position()
             }
         }
     }

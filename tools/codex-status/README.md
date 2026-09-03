@@ -7,8 +7,8 @@
 - Codex 周额度和重置时间
 - Clash/mihomo TUN 是否真正生效、当前 AI 代理节点
 - 当前节点的真实 GPT 首连成功率、流重连、连续稳定轮数和轻量端点 P50/P90
-- 仅在当前连接不稳定时给出已验证稳定节点建议；未验证节点只提供手动“试用”
-- 节点切换写入后会回读 selector 确认；旧连接未结束时显示“旧连接收尾”
+- 仅在当前连接不稳定时显示已验证稳定节点建议；未验证节点标记为“候选节点”
+- App 不修改 selector，用户在 Clash 中手动切换；旧连接未结束时显示“旧连接收尾”
 - ChatGPT 网络延迟、Codex 最近五分钟首输出等待和保守诊断
 - CPU、内存、实时上下行网速
 - 连接诊断中的 ChatGPT 延迟图，以及系统区的网络速度滚动图（最近三分钟）
@@ -48,9 +48,8 @@ cd ai/tools/codex-status
 - 不读取提示词、工具参数和工作目录
 - Codex 性能诊断只读取本机日志中的时间、模型、reasoning effort、事件类型和重试元数据
 - 节点稳定性历史保存在 `~/.config/quota-widget/gpt_node_quality.json`，仅包含最近 24 小时、至多 20 轮的聚合性能元数据，权限为 `0600`
-- 最近 100 次节点切换结果保存在 `~/.config/quota-widget/switch_audit.jsonl`，只记录时间、节点名和成功/失败原因，权限为 `0600`
 - 最近 100 条脚本启动、退出和解码错误保存在 `~/.config/quota-widget/app_events.log`，不记录提示词或认证信息，权限为 `0600`
-- 节点测速通过 mihomo 让候选节点分别访问 ChatGPT 轻量端点；测速不切换节点、不调用模型，只有点击“切换”或“试用”才切换
+- 节点测速通过 mihomo 让候选节点分别访问 ChatGPT 轻量端点；测速不切换节点、不调用模型，App 也不提供 selector 写操作
 - 配置保存在 `~/.config/quota-widget/config.json`，权限设置为 `0600`
 - 额度请求使用当前用户自己的 Codex 登录态
 

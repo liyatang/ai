@@ -8,7 +8,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from diagnostics import TARGET_CLIENT, TARGET_OUTPUT, TARGET_RETRY, TARGET_WEBSOCKET, _decode_chunked, analyze_codex_rows, choose_gpt_recommendation, evaluate_tun, read_codex_activity, read_proxy_state, read_tun_state, record_switch_audit, resolve_gpt_proxy_context, resolve_proxy_state, summarize_node_quality, switch_gpt_node, update_quality_history  # noqa: E402
+from diagnostics import TARGET_CLIENT, TARGET_OUTPUT, TARGET_RETRY, TARGET_WEBSOCKET, _decode_chunked, analyze_codex_rows, choose_gpt_recommendation, evaluate_tun, read_codex_activity, read_proxy_state, read_tun_state, resolve_gpt_proxy_context, resolve_proxy_state, summarize_node_quality, update_quality_history  # noqa: E402
 
 TURN_A = "01a00000-0000-7000-8000-000000000001"
 TURN_B = "01a00000-0000-7000-8000-000000000002"
@@ -288,76 +288,82 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertTrue(history["turns"]["during-switch"]["ignored_after_switch"])
         self.assertEqual(summarize_node_quality(history, "新加坡", now)["turn_count"], 0)
 
-    def test_switch_audit_is_private_and_bounded(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "switch_audit.jsonl")
-            for index in range(5):
-                record_switch_audit({"at": index, "ok": True}, path=path, limit=3)
-            with open(path, encoding="utf-8") as file:
-                entries = [line for line in file.read().splitlines() if line]
-            self.assertEqual(len(entries), 3)
-            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+    def test_manual_selector_change_assigns_later_turns_to_current_node(self):
+        now = 1_800_000_000.0
+        history = {
+            "version": 1,
+            "created_at": now - 1000,
+            "turns": {},
+            "switches": [{
+                "at": now - 500,
+                "from": "日本 AI",
+                "to": "日本 01",
+                "source": "app",
+            }],
+        }
+        # 首次看到 Clash 被手动切回日本 AI：跨切换的活动轮次不参与质量统计。
+        active = [{
+            "turn_id": "during-manual-switch",
+            "start_at": now - 10,
+            "last_seen_at": now - 2,
+            "has_output": True,
+            "retry_count": 0,
+        }]
+        update_quality_history(history, "日本 AI", active, now)
+        self.assertEqual(history["selected_node"], "日本 AI")
+        self.assertEqual(history["switches"][-1]["source"], "observed")
+        self.assertTrue(history["turns"]["during-manual-switch"]["ignored_after_switch"])
 
-    @mock.patch("diagnostics._unix_http_request")
-    @mock.patch("diagnostics._unix_http_json")
-    def test_switch_gpt_node_targets_resolved_selector(self, read_json, request):
-        before = {"proxies": {
-            "🤖 AI": {"type": "Selector", "now": "🔰 手动选择", "all": ["🔰 手动选择"]},
-            "🔰 手动选择": {
-                "type": "Selector",
-                "now": "🇺🇸 美国 AI",
-                "all": ["🇭🇰 香港 01", "🇸🇬 新加坡 01", "🇺🇸 美国 AI"],
+        # 切换后开始的新轮次必须归当前节点，不能再被旧 target 覆盖。
+        later = [{
+            "turn_id": "after-manual-switch",
+            "start_at": now + 35,
+            "last_seen_at": now + 38,
+            "has_output": True,
+            "retry_count": 0,
+        }]
+        update_quality_history(history, "日本 AI", later, now + 40)
+        self.assertEqual(history["turns"]["after-manual-switch"]["node"], "日本 AI")
+        self.assertEqual(summarize_node_quality(history, "日本 AI", now + 40)["turn_count"], 1)
+
+    def test_old_switch_target_does_not_override_current_node(self):
+        now = 1_800_000_000.0
+        history = {
+            "version": 1,
+            "created_at": now - 1000,
+            "selected_node": "日本 AI",
+            "turns": {},
+            "switches": [{"at": now - 500, "from": "日本 AI", "to": "日本 01"}],
+        }
+        turns = [{
+            "turn_id": "new-current-turn",
+            "start_at": now - 5,
+            "last_seen_at": now - 1,
+            "has_output": True,
+            "retry_count": 0,
+        }]
+        update_quality_history(history, "日本 AI", turns, now)
+        self.assertEqual(history["turns"]["new-current-turn"]["node"], "日本 AI")
+
+    def test_quality_node_names_ignore_surrounding_whitespace(self):
+        now = 1_800_000_000.0
+        history = {
+            "version": 1,
+            "created_at": now - 100,
+            "turns": {
+                "sample": {
+                    "node": "日本 AI ",
+                    "start_at": now - 10,
+                    "last_seen_at": now - 5,
+                    "has_output": True,
+                    "retry_count": 0,
+                }
             },
-            "🇭🇰 香港 01": {"type": "Vless"},
-            "🇸🇬 新加坡 01": {"type": "Vless"},
-            "🇺🇸 美国 AI": {"type": "Vless"},
-        }}
-        after = {"proxies": {
-            **before["proxies"],
-            "🔰 手动选择": {
-                **before["proxies"]["🔰 手动选择"],
-                "now": "🇸🇬 新加坡 01",
-            },
-        }}
-        read_json.side_effect = [before, after]
-        request.return_value = (204, b"")
-
-        result = switch_gpt_node(
-            "🇸🇬 新加坡 01", "/tmp/test.sock", quality_path=None, audit_path=None
-        )
-
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["actual_name"], "🇸🇬 新加坡 01")
-        request.assert_called_once_with(
-            "/tmp/test.sock",
-            "/proxies/%F0%9F%94%B0%20%E6%89%8B%E5%8A%A8%E9%80%89%E6%8B%A9",
-            timeout=1.0,
-            method="PUT",
-            payload={"name": "🇸🇬 新加坡 01"},
-        )
-
-    @mock.patch("diagnostics._unix_http_request", return_value=(204, b""))
-    @mock.patch("diagnostics._unix_http_json")
-    def test_switch_gpt_node_rejects_unconfirmed_selector(self, read_json, _request):
-        payload = {"proxies": {
-            "🤖 AI": {"type": "Selector", "now": "🔰 手动选择", "all": ["🔰 手动选择"]},
-            "🔰 手动选择": {
-                "type": "Selector",
-                "now": "🇺🇸 美国 AI",
-                "all": ["🇸🇬 新加坡 01", "🇺🇸 美国 AI"],
-            },
-            "🇸🇬 新加坡 01": {"type": "Vless"},
-            "🇺🇸 美国 AI": {"type": "Vless"},
-        }}
-        read_json.side_effect = [payload, payload]
-
-        result = switch_gpt_node(
-            "🇸🇬 新加坡 01", "/tmp/test.sock", quality_path=None, audit_path=None
-        )
-
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["actual_name"], "🇺🇸 美国 AI")
-        self.assertIn("实际仍为", result["error"])
+            "switches": [],
+        }
+        quality = summarize_node_quality(history, " 日本 AI", now)
+        self.assertEqual(quality["node"], "日本 AI")
+        self.assertEqual(quality["turn_count"], 1)
 
     def test_decodes_chunked_mihomo_response(self):
         self.assertEqual(_decode_chunked(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n"), b"Wikipedia")
