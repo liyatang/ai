@@ -11,7 +11,7 @@
 - App 不修改 selector，用户在 Clash 中手动切换；旧连接未结束时显示“旧连接收尾”
 - ChatGPT 网络延迟、Codex 最近五分钟首输出等待和保守诊断
 - CPU、内存、实时上下行网速
-- GPT 本机资源：汇总 ChatGPT/Codex 应用包内进程的 CPU 和内存足迹，后台约每 6 秒更新；不包含应用包外的项目服务。CPU 为 `ps` 进程口径（单核 100%，多核可超过 100%）；内存通过 `proc_pid_rusage` 读取 `ri_phys_footprint`，按十进制 GB 显示，更接近活动监视器的内存口径，但采样时刻和进程分组可能不同。任一进程内存读取失败时显示“内存不可用”，不回退到 RSS；这些数据不代表云端模型资源。
+- GPT 本机资源：汇总 ChatGPT/Codex 应用包内进程，以及当前用户 `.codex/computer-use/` 下的 Computer Use 专用服务、`.codex/plugins/cache/openai-bundled/chrome/` 下的 Chrome 通信助手；按明确程序路径识别，不依赖父进程，每个 PID 只计一次。排除共享系统辅助服务、整个外部浏览器、项目 Node/next-server、Docker 和状态小组件。后台约每 6 秒更新；CPU 为 `ps` 进程口径（单核 100%，多核可超过 100%）；内存通过 `proc_pid_rusage` 读取 `ri_phys_footprint`，按十进制 GB 显示，更接近活动监视器的内存口径，但采样时刻和进程分组可能不同。任一进程内存读取失败时显示“内存不可用”，不回退到 RSS；这些数据不代表云端模型资源。
 - 连接诊断中的 ChatGPT 延迟图，以及系统区的网络速度滚动图（最近三分钟）
 
 ## 用 Codex 安装（推荐）

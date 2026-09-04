@@ -280,21 +280,43 @@ func processMemoryFootprint(_ pid: Int32) -> UInt64? {
     return result == 0 ? info.ri_phys_footprint : nil
 }
 
+func isGPTResourceProcess(_ executable: String, homeDirectory: String = NSHomeDirectory()) -> Bool {
+    guard executable.hasPrefix("/"),
+          !executable.split(separator: "/").contains("..") else { return false }
+    if executable.contains("/ChatGPT.app/Contents/")
+        || executable.contains("/Codex.app/Contents/") { return true }
+
+    let home = (homeDirectory as NSString).standardizingPath
+    for bundle in ["Codex Computer Use.app", "ChatGPT Computer Use.app"] {
+        if executable == home + "/.codex/computer-use/" + bundle
+            + "/Contents/MacOS/SkyComputerUseService" { return true }
+    }
+    let chromeRoot = home + "/.codex/plugins/cache/openai-bundled/chrome/"
+    guard executable.hasPrefix(chromeRoot) else { return false }
+    let parts = executable.dropFirst(chromeRoot.count).split(separator: "/", omittingEmptySubsequences: false)
+    return parts.count == 5 && !parts[0].isEmpty && parts[0] != "."
+        && parts[1] == "extension-host" && parts[2] == "macos"
+        && ["arm64", "x86_64", "x64"].contains(String(parts[3]))
+        && parts[4] == "ChatGPT for Chrome"
+}
+
 func parseGPTLocalResources(
     _ output: String,
+    homeDirectory: String = NSHomeDirectory(),
     memoryFootprint: (Int32) -> UInt64? = processMemoryFootprint
 ) -> GPTLocalResources {
     var count = 0
     var cpu = 0.0
     var memory: UInt64 = 0
     var memoryComplete = true
+    var seenPIDs = Set<Int32>()
     for line in output.split(separator: "\n") {
         let fields = line.split(maxSplits: 3, whereSeparator: { $0.isWhitespace })
         guard fields.count == 4, let pid = Int32(fields[0]), pid > 0,
               let usage = Double(fields[2]), usage.isFinite, usage >= 0 else { continue }
         let executable = String(fields[3])
-        guard executable.contains("/ChatGPT.app/Contents/")
-                || executable.contains("/Codex.app/Contents/") else { continue }
+        guard isGPTResourceProcess(executable, homeDirectory: homeDirectory),
+              seenPIDs.insert(pid).inserted else { continue }
         count += 1
         cpu += usage
         if let bytes = memoryFootprint(pid), bytes <= UInt64.max - memory {
