@@ -2,6 +2,12 @@
 
 个人使用的轻量 AI 工具集合。
 
+## 应用截图
+
+<img src="tools/codex-status/docs/screenshot.jpg" alt="Codex 状态应用截图：额度、GPT 连接诊断、本机 CPU 与内存、系统资源趋势" width="330">
+
+截图为实际运行示例，数值随使用情况变化。
+
 ## Tools
 
 | 工具 | 说明 |

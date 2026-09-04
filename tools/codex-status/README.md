@@ -2,6 +2,10 @@
 
 面向 Apple Silicon Mac 的轻量桌面状态卡片，固定显示在主屏幕左上角。
 
+<img src="docs/screenshot.jpg" alt="Codex 状态应用截图：额度、GPT 连接诊断、本机 CPU 与内存、系统资源趋势" width="330">
+
+截图为实际运行示例，数值随使用情况变化。
+
 它显示：
 
 - Codex 周额度和重置时间
