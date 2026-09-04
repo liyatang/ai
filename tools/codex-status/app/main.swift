@@ -264,6 +264,66 @@ func fetchGPTNodeBenchmark() -> GPTNodeBenchmark? {
 
 // MARK: - 系统采样（CPU/内存/网络，本地 syscall，按采样间隔差分）
 
+struct GPTLocalResources {
+    let processCount: Int
+    let cpuPercent: Double
+    let memoryBytes: UInt64?
+}
+
+func processMemoryFootprint(_ pid: Int32) -> UInt64? {
+    var info = rusage_info_v2()
+    let result = withUnsafeMutablePointer(to: &info) { pointer in
+        pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+            proc_pid_rusage(pid, RUSAGE_INFO_V2, $0)
+        }
+    }
+    return result == 0 ? info.ri_phys_footprint : nil
+}
+
+func parseGPTLocalResources(
+    _ output: String,
+    memoryFootprint: (Int32) -> UInt64? = processMemoryFootprint
+) -> GPTLocalResources {
+    var count = 0
+    var cpu = 0.0
+    var memory: UInt64 = 0
+    var memoryComplete = true
+    for line in output.split(separator: "\n") {
+        let fields = line.split(maxSplits: 3, whereSeparator: { $0.isWhitespace })
+        guard fields.count == 4, let pid = Int32(fields[0]), pid > 0,
+              let usage = Double(fields[2]), usage.isFinite, usage >= 0 else { continue }
+        let executable = String(fields[3])
+        guard executable.contains("/ChatGPT.app/Contents/")
+                || executable.contains("/Codex.app/Contents/") else { continue }
+        count += 1
+        cpu += usage
+        if let bytes = memoryFootprint(pid), bytes <= UInt64.max - memory {
+            memory += bytes
+        } else {
+            memoryComplete = false
+        }
+    }
+    return GPTLocalResources(processCount: count, cpuPercent: cpu,
+                             memoryBytes: memoryComplete ? memory : nil)
+}
+
+func fetchGPTLocalResources() -> GPTLocalResources? {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/ps")
+    // comm 只包含可执行文件路径，不读取命令参数或提示词。
+    process.arguments = ["-axo", "pid=,ppid=,pcpu=,comm="]
+    process.environment = ["LC_ALL": "C", "PATH": "/usr/bin:/bin"]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = FileHandle.nullDevice
+    do { try process.run() } catch { return nil }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0,
+          let output = String(data: data, encoding: .utf8) else { return nil }
+    return parseGPTLocalResources(output)
+}
+
 struct SysStats {
     var cpuPct = 0           // 0-100
     var memUsed: UInt64 = 0   // 字节
@@ -585,6 +645,9 @@ func attrString(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular,
 // MARK: - 卡片视图（自绘）
 
 class CardView: NSView {
+    var gptLocalResources: GPTLocalResources? {
+        didSet { needsDisplay = true }
+    }
     var data: QuotaData? {
         didSet { needsDisplay = true }
     }
@@ -641,6 +704,13 @@ class CardView: NSView {
             parts.append("GPT稳定性\(quality.status)，\(quality.turn_count ?? 0)轮")
         }
         if diagnosticsStale { parts.append("连接诊断已过期") }
+        if let resources = gptLocalResources {
+            let memory = resources.memoryBytes.map {
+                String(format: "内存 %.2f GB", Double($0) / 1_000_000_000)
+            } ?? "内存不可用"
+            parts.append(String(format: "GPT 本机 CPU %.1f%%，%@，%d个进程",
+                                resources.cpuPercent, memory, resources.processCount))
+        }
         if let sys {
             let mem = sys.memTotal > 0
                 ? min(100, Int(Double(sys.memUsed) / Double(sys.memTotal) * 100)) : 0
@@ -902,8 +972,20 @@ class CardView: NSView {
 
     private func sysItems(_ s: SysStats) -> [Item] {
         let memPct = s.memTotal > 0 ? min(100, Int(Double(s.memUsed) / Double(s.memTotal) * 100)) : 0
+        let localCPU: String
+        let localMemory: String?
+        if let resources = gptLocalResources {
+            localCPU = resources.processCount == 0 ? "未运行" : String(format: "CPU %.1f%%", resources.cpuPercent)
+            localMemory = resources.processCount == 0 ? nil : resources.memoryBytes.map {
+                String(format: " · 内存 %.2f GB", Double($0) / 1_000_000_000)
+            } ?? " · 内存不可用"
+        } else {
+            localCPU = "采样不可用"
+            localMemory = nil
+        }
         return [
             .divider,
+            .summary("GPT 本机", localCPU, textColor, localMemory, textColor),
             .summary(
                 "系统",
                 "CPU \(s.cpuPct)%",
@@ -1339,6 +1421,8 @@ class WidgetPanel: NSPanel {
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
+    private var localResourcesInFlight = false
+    private var lastLocalResourcesAt = Date.distantPast
     let card = CardView()
     var panel: WidgetPanel!
     private var fetchTimer: Timer?
@@ -1571,6 +1655,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func sampleSys() {
         let oldH = card.cardHeight
         card.sys = sampler.sample()
+        if !localResourcesInFlight, Date().timeIntervalSince(lastLocalResourcesAt) >= 5 {
+            localResourcesInFlight = true
+            lastLocalResourcesAt = Date()
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let resources = fetchGPTLocalResources()
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.localResourcesInFlight = false
+                    self.card.gptLocalResources = resources
+                }
+            }
+        }
         if abs(card.cardHeight - oldH) > 0.5 { position() }
     }
 }
