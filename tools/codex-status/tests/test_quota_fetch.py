@@ -6,6 +6,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -23,9 +24,36 @@ class QuotaFetchTests(unittest.TestCase):
         })
         self.assertEqual(window["id"], "周")
         self.assertEqual(window["used_pct"], 13)
-        self.assertEqual(
-            quota_fetch.parse_gpt_window({"used_percent": 120})["used_pct"], 100
-        )
+        self.assertIsNone(quota_fetch.parse_gpt_window({"used_percent": 120})["used_pct"])
+
+    def test_missing_invalid_and_nonfinite_usage_is_unknown(self):
+        for value in [None, "bad", float("nan"), float("inf"), -1, 101, True]:
+            self.assertIsNone(quota_fetch.parse_gpt_window({"used_percent":value})["used_pct"])
+        self.assertIsNone(quota_fetch.parse_gpt_window({"limit_window_seconds":604800})["used_pct"])
+
+    def test_cache_failure_keeps_success_time_and_invalidates_after_reset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            auth=os.path.join(directory,"dummy-identity")
+            open(auth,"w").close()
+            cfg={"gpt":{"auth_json":auth}}
+            cache=os.path.join(directory,"cache.json")
+            def run(at):
+                output=io.StringIO()
+                with patch.object(quota_fetch.time,"time",return_value=at),contextlib.redirect_stdout(output):
+                    quota_fetch.main()
+                return json.loads(output.getvalue())
+            with patch.object(quota_fetch,"load_config",return_value=cfg),patch.object(quota_fetch,"CACHE_PATH",cache):
+                good={"ok":True,"windows":[{"id":"周","used_pct":20,"reset_at":1100}]}
+                with patch.object(quota_fetch,"fetch_gpt",return_value=good):
+                    self.assertEqual(run(1000)["last_success_at"],1000)
+                with patch.object(quota_fetch,"fetch_gpt",side_effect=RuntimeError("failed")):
+                    stale=run(1020)
+                    self.assertEqual(stale["last_success_at"],1000)
+                    self.assertTrue(stale["gpt"]["stale"])
+                    expired=run(1200)
+                    self.assertFalse(expired["gpt"]["ok"])
+                    with open(auth,"w") as f:f.write("new identity")
+                    self.assertFalse(run(1030)["gpt"]["ok"])
 
     def test_missing_codex_login_has_compact_degradation_reason(self):
         with tempfile.TemporaryDirectory() as directory:

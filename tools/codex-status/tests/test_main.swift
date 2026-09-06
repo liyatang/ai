@@ -1,107 +1,53 @@
 import AppKit
 import Foundation
-
-private func quality(_ node: String, _ status: String) -> GPTNodeQuality {
-    GPTNodeQuality(
-        node: node,
-        status: status,
-        confidence: "low",
-        turn_count: 1,
-        required_turn_count: 10,
-        first_attempt_success_pct: 100,
-        retry_turn_count: 0,
-        retry_count: 0,
-        max_retries_per_turn: 0,
-        opening_retry_count: 0,
-        tls_eof_count: 0,
-        connection_closed_count: 0,
-        hard_failure_count: 0,
-        stable_streak: 1
-    )
-}
-
 private func require(_ condition: @autoclosure () -> Bool, _ message: String) {
-    if !condition() {
-        FileHandle.standardError.write(Data("FAIL: \(message)\n".utf8))
-        exit(1)
-    }
+    if !condition() { fatalError(message) }
 }
-
-let oldQuality = quality("旧节点", "unstable")
-let newQuality = quality("新节点", "observing")
-let diagnostics = DiagnosticsData(
-            updated: 1,
-            tun: TunStateData(state: "enabled", detail: nil),
-            proxy: ProxyStateData(
-                available: true,
-                name: "新节点",
-                selected_name: "新节点",
-                active_name: "旧节点",
-                transitioning: true,
-                source: "policy",
-                detail: nil
-            ),
-            codex: CodexActivity(
-                available: true,
-                active: false,
-                window_seconds: 300,
-                turn_count: 0,
-                sample_count: 0,
-                first_output_median_seconds: nil,
-                first_output_p90_seconds: nil,
-                retry_count: 0,
-                retry_turn_count: 0,
-                first_attempt_success_pct: nil,
-                max_retries_per_turn: 0,
-                opening_retry_count: 0,
-                tls_eof_count: 0,
-                connection_closed_count: 0,
-                stable_streak: 0,
-                model: nil,
-                reasoning_effort: nil,
-                error: nil
-            ),
-            gpt_quality: oldQuality
-        )
-let benchmark = GPTNodeBenchmark(
-            available: true,
-            updated: 2,
-            current_name: "新节点",
-            current: nil,
-            recommended: nil,
-            trial: nil,
-            best: nil,
-            current_quality: newQuality,
-            recommendation_kind: nil,
-            error: nil
-        )
-
-require(
-    matchingQuality(for: "新节点", diagnostics: diagnostics, benchmark: benchmark)?.status
-        == "observing",
-    "新节点不能沿用旧节点的不稳定状态"
-)
-require(
-    matchingQuality(for: "旧节点", diagnostics: diagnostics, benchmark: benchmark)?.status
-        == "unstable",
-    "旧节点仍应读取其自身稳定性"
-)
-require(
-    matchingQuality(for: "未知节点", diagnostics: diagnostics, benchmark: benchmark) == nil,
-    "未知节点不能借用其他节点质量"
-)
-require(normalizedNodeName(" 节点 \n") == "节点", "节点名称应统一去除空白")
-
 var gate = GenerationGate()
-let oldBenchmarkToken = gate.current
-_ = gate.invalidate()
-require(!gate.accepts(oldBenchmarkToken), "切换后必须丢弃切换前仍在执行的测速结果")
-require(gate.accepts(gate.current), "当前代测速结果应被接受")
-require(
-    latestDisplayUpdated(quota: 100, diagnostics: 200) == 200,
-    "更新时间应展示较新的连接诊断时间"
-)
-print("Swift card state tests passed")
+let old = gate.current
+gate.invalidate()
+require(!gate.accepts(old), "旧观察代次不能回填")
+var refresh = RefreshGate()
+require(refresh.begin(), "首次刷新开始")
+require(!refresh.begin() && !refresh.begin(), "刷新不能并发")
+require(refresh.finish(), "运行中刷新合并一次")
+require(refresh.begin() && !refresh.finish(), "合并请求结束后不再重入")
+let started = Date()
+let timed = runProcess(executable: URL(fileURLWithPath: "/bin/sleep"), arguments: ["3"], timeout: 0.05)
+require(timed == nil && Date().timeIntervalSince(started) < 2, "子进程超时必须回收")
+let valid = runProcess(executable: URL(fileURLWithPath: "/usr/bin/printf"), arguments: ["ok"], timeout: 1)
+require(valid == Data("ok".utf8), "超时后下次采集仍能成功")
+let failed = runProcess(executable: URL(fileURLWithPath: "/usr/bin/false"), arguments: [], timeout: 1)
+require(failed == nil, "非零退出不能作为有效数据")
+let card = CardView()
+require(card.cardHeight > 500 && card.cardWidth == 330, "缺额度也保留完整面板")
+require(card.displayedAdvice == "等待采集恢复", "过期或缺数据不显示切换建议")
+func diagnosticFixture(epoch: String, age: Double = 0) -> DiagnosticsData {
+    let now = Date().timeIntervalSince1970
+    return DiagnosticsData(schema_version:2,observed_at:now-age,epoch:epoch,epoch_started:now-100,
+        source:SourceState(state:"ok",observed_at:now-age,error:nil),
+        tun:TunState(state:"enabled",detail:nil),
+        proxy:ProxyState(available:true,certain:true,name:epoch,selected_name:epoch,active_name:epoch,
+                         selector:"Proxy",detail:nil,transitioning:false),
+        probe:ProbeState(state:"ok",observed_at:now-age,interval:30),
+        diagnosis:Diagnosis(status:"sustained",severity:"danger",title:"连接持续异常",advice:"可尝试：候选",
+                            activity:"后台重试",retry_count:3,history_count:9,last_retry_at:now-5,active:true,
+                            can_compare:true,evidence:[]))
+}
+let coordinator = AppDelegate()
+require(coordinator.acceptDiagnostics(diagnosticFixture(epoch:"A"),token:coordinator.generation.current),"首次观察应被接受")
+let beforeSwitch = coordinator.generation.current
+coordinator.samples = [ProbeSample(at:Date().timeIntervalSince1970,latency_ms:5000,ok:false)]
+coordinator.card.recordLatencySample(latencyMs:5000,ok:false)
+require(coordinator.acceptDiagnostics(diagnosticFixture(epoch:"B"),token:beforeSwitch),"节点切换应被接受")
+require(coordinator.samples.isEmpty && coordinator.card.latencySamples.isEmpty,"切换必须清空旧节点探针")
+let late = Benchmark(schema_version:2,epoch:"A",observed_at:Date().timeIntervalSince1970,candidate:Candidate(name:"B",median_ms:1,p90_ms:1),error:nil)
+require(!coordinator.acceptBenchmark(late,token:beforeSwitch) && coordinator.benchmarkData == nil,"旧候选晚返回不能覆盖当前节点")
+require(!coordinator.acceptDiagnostics(diagnosticFixture(epoch:"A"),token:beforeSwitch),"旧诊断晚返回不能倒退")
+coordinator.card.diagnostics = diagnosticFixture(epoch:"B",age:46)
+require(!coordinator.card.currentFresh && coordinator.card.displayedAdvice == "等待采集恢复","过期故障必须退出建议")
+print("Swift observation lifecycle tests passed")
+
 let resources = parseGPTLocalResources("""
 10 1 12.5 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT
 11 10 105.0 /Applications/ChatGPT.app/Contents/Frameworks/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)

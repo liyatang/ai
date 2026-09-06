@@ -7,6 +7,8 @@ GPT:  mode=codex  读 ~/.codex/auth.json 的 access_token/account_id
       mode=session 用浏览器 __Secure-next-auth.session-token（实验性，接口结构未验证）
 """
 import base64
+import hashlib
+import math
 import json
 import os
 import sys
@@ -15,7 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-DIR = os.path.dirname(os.path.abspath(__file__))
+DIR = os.path.expanduser("~/.config/quota-widget")
 CONFIG_PATH = os.path.join(DIR, "config.json")
 CACHE_PATH = os.path.join(DIR, "cache.json")
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -80,11 +82,12 @@ def parse_gpt_window(w):
     if not w:
         return None
     secs = w.get("limit_window_seconds", 0)
-    raw_used = w.get("used_percent", 0)
+    raw_used = w.get("used_percent")
     try:
-        used_pct = max(0, min(100, round(float(raw_used))))
+        value = float(raw_used)
+        used_pct = round(value) if math.isfinite(value) and 0 <= value <= 100 and not isinstance(raw_used, bool) else None
     except (TypeError, ValueError):
-        used_pct = 0
+        used_pct = None
     name = {18000: "5h", 604800: "周"}.get(secs, f"{secs // 86400}d" if secs >= 86400 else f"{secs // 3600}h")
     return {
         "id": name,
@@ -191,7 +194,14 @@ def main():
     timeout = cfg.get("timeout_seconds", 20)
     proxy = cfg.get("proxy")
 
-    result = {"updated": int(time.time())}
+    result = {"schema_version": 2, "updated": int(time.time()), "last_success_at": None}
+    identity = None
+    try:
+        auth_path = os.path.expanduser((cfg.get("gpt") or {}).get("auth_json", "~/.codex/auth.json"))
+        stat = os.stat(auth_path)
+        identity = hashlib.sha256(f"{stat.st_ino}:{stat.st_mtime_ns}:{stat.st_size}".encode()).hexdigest()
+    except OSError:
+        pass
     cache = {}
     if os.path.exists(CACHE_PATH):
         try:
@@ -203,12 +213,18 @@ def main():
     changed = False
     try:
         result["gpt"] = fetch_gpt(cfg, timeout, proxy)
-        cache = {"gpt": result["gpt"]}
+        result["last_success_at"] = result["updated"]
+        cache = {"gpt": result["gpt"], "identity": identity, "last_success_at": result["updated"]}
         changed = True
     except Exception as e:
-        old = cache.get("gpt")
+        old = cache.get("gpt") if identity and cache.get("identity") == identity else None
+        succeeded = cache.get("last_success_at")
+        if not succeeded or result["updated"] - succeeded > 1200:
+            old = None
         if old and old.get("ok"):
-            old = dict(old, stale=True, error=str(e))
+            windows = [w for w in old.get("windows", []) if isinstance(w.get("reset_at"),(int,float)) and w["reset_at"] > result["updated"]]
+            old = dict(old, windows=windows, ok=bool(windows), stale=True, error=str(e))
+            result["last_success_at"] = succeeded
         result["gpt"] = old or {"ok": False, "error": str(e), "windows": []}
 
     if changed:

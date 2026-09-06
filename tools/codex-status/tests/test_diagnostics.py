@@ -1,373 +1,221 @@
+import contextlib
 import os
 import sqlite3
 import sys
 import tempfile
 import unittest
-from unittest import mock
+from unittest.mock import patch
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+import diagnostics as coordinator
+import status_proxy as proxy
+import status_logs as logs
+from status_engine import project,rank_candidates
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
+NOW=1800000000
+TURN='01a00000-0000-7000-8000-000000000001'
 
-from diagnostics import TARGET_CLIENT, TARGET_OUTPUT, TARGET_RETRY, TARGET_WEBSOCKET, _decode_chunked, analyze_codex_rows, choose_gpt_recommendation, evaluate_tun, read_codex_activity, read_proxy_state, read_tun_state, resolve_gpt_proxy_context, resolve_proxy_state, summarize_node_quality, update_quality_history  # noqa: E402
+def event(i,age=0,kind='retry',task='a'):
+    return dict(id=str(i),at=NOW-age,kind=kind,task=task)
 
-TURN_A = "01a00000-0000-7000-8000-000000000001"
-TURN_B = "01a00000-0000-7000-8000-000000000002"
+def projection(events,previous=None,now=NOW,route=None,source=None,probe=None,started=NOW-300):
+    return project(events,route or {'certain':True,'identity_confirmed':True},source or {'state':'ok','observed_at':now},
+                   probe or {},previous or {},now,started)
 
+class EngineTests(unittest.TestCase):
+    def test_screenshot_nine_historical_retries_do_not_make_current_red(self):
+        events=[event(i,80000+i) for i in range(6)]+[event(i+6,700+i*30) for i in range(3)]+[event(10,20,'output')]
+        result=projection(events)
+        self.assertEqual(result['history_count'],9)
+        self.assertEqual(result['retry_count'],0)
+        self.assertEqual(result['status'],'clear')
+        self.assertFalse(result['can_compare'])
 
-class DiagnosticsTests(unittest.TestCase):
-    def test_aggregates_concurrent_turns_without_content(self):
-        now = 1_800_000_000.0
-        rows = [
-            (int(now - 20), 0, TARGET_WEBSOCKET, "INFO", TURN_A, "gpt-5.6-sol", "medium"),
-            (int(now - 18), 0, TARGET_WEBSOCKET, "INFO", TURN_B, "gpt-5.6-luna", "low"),
-            (int(now - 14), 0, TARGET_OUTPUT, "DEBUG", TURN_A, None, None),
-            (int(now - 10), 0, TARGET_OUTPUT, "DEBUG", TURN_B, None, None),
-            (int(now - 9), 0, TARGET_RETRY, "WARN", TURN_B, None, None),
-        ]
-        result = analyze_codex_rows(rows, now)
-        self.assertTrue(result["active"])
-        self.assertEqual(result["turn_count"], 2)
-        self.assertEqual(result["sample_count"], 2)
-        self.assertEqual(result["first_output_median_seconds"], 7.0)
-        self.assertEqual(result["retry_count"], 1)
-        self.assertEqual(result["model"], "gpt-5.6-luna")
-        self.assertEqual(result["reasoning_effort"], "low")
+    def test_recovered_events_do_not_require_switch(self):
+        events=[event(i,30+i) for i in range(3)]+[event(4,10,'output')]
+        result=projection(events)
+        self.assertEqual(result['status'],'recovered')
+        self.assertFalse(result['can_compare'])
 
-    def test_idle_does_not_reuse_old_turn(self):
-        now = 1_800_000_000.0
-        result = analyze_codex_rows(
-            [(int(now - 301), 0, TARGET_WEBSOCKET, "INFO", TURN_A, "gpt-5.6-sol", "medium")], now
-        )
-        self.assertFalse(result["active"])
-        self.assertIsNone(result["first_output_median_seconds"])
+    def test_two_distinct_collections_and_recovery(self):
+        events=[event(i,20+i) for i in range(3)]
+        first=projection(events)
+        self.assertEqual(first['status'],'retrying')
+        too_soon=projection(events,first['state'],NOW+1)
+        self.assertEqual(too_soon['status'],'retrying')
+        second=projection(events,first['state'],NOW+15)
+        self.assertEqual(second['status'],'sustained')
+        recovered=projection(events+[dict(id='o',at=NOW+16,kind='output',task='a')],second['state'],NOW+17)
+        self.assertEqual(recovered['status'],'recovered')
 
-    def test_current_client_target_is_recognized(self):
-        now = 1_800_000_000.0
-        result = analyze_codex_rows([
-            (int(now - 10), 0, TARGET_CLIENT, "TRACE", TURN_A, "gpt-5.6-sol", "medium"),
-            (int(now - 7), 0, TARGET_OUTPUT, "DEBUG", TURN_A, None, None),
-        ], now)
-        self.assertTrue(result["active"])
-        self.assertEqual(result["first_output_median_seconds"], 3.0)
+    def test_concurrent_output_cannot_recover_other_task(self):
+        events=[event(i,30+i) for i in range(3)]+[event(4,1,'output','b')]
+        first=projection(events)
+        self.assertEqual(projection(events,first['state'],NOW+15)['status'],'sustained')
 
-    def test_recent_output_keeps_long_turn_active(self):
-        now = 1_800_000_000.0
-        result = analyze_codex_rows([
-            (int(now - 600), 0, TARGET_CLIENT, "TRACE", TURN_A, "gpt-5.6-sol", "medium"),
-            (int(now - 10), 0, TARGET_OUTPUT, "DEBUG", TURN_A, None, None),
-        ], now)
-        self.assertTrue(result["active"])
-        self.assertEqual(result["turn_count"], 1)
-        self.assertEqual(result["sample_count"], 0)
+    def test_recovered_task_cannot_supply_threshold_for_other_task(self):
+        events=[event(i,30+i) for i in range(3)]+[event(4,20,'output'),event(5,5,'retry','b')]
+        first=projection(events)
+        self.assertEqual(projection(events,first['state'],NOW+15)['status'],'retrying')
 
-    def test_schema_error_degrades(self):
+    def test_no_output_never_implies_network_failure(self):
+        self.assertEqual(projection([event(1,250,'activity')])['status'],'clear')
+        self.assertEqual(projection([])['status'],'unknown')
+
+    def test_stale_incomplete_and_unknown_route_never_recommend(self):
+        events=[event(i,10+i) for i in range(3)]
+        first=projection(events)
+        for source in [{'state':'ok','observed_at':NOW-46},{'state':'incomplete','observed_at':NOW},{'state':'unavailable','observed_at':NOW}]:
+            self.assertFalse(projection(events,first['state'],NOW+15,source=source)['can_compare'])
+        self.assertFalse(projection(events,first['state'],NOW+15,route={'certain':False})['can_compare'])
+
+    def test_probe_three_failures_two_successes_and_expiry(self):
+        def p(samples,at=NOW):return dict(state='ok',observed_at=at,interval=30,samples=samples)
+        samples=[dict(at=NOW-i*30,ok=False) for i in [2,1,0]]
+        first=projection([],probe=p(samples))
+        self.assertEqual(first['status'],'probe_failed')
+        one=projection([],first['state'],NOW+30,probe=p(samples+[dict(at=NOW+30,ok=True)],NOW+30))
+        self.assertEqual(one['status'],'probe_failed')
+        two=projection([],one['state'],NOW+60,probe=p(samples+[dict(at=NOW+30,ok=True),dict(at=NOW+60,ok=True)],NOW+60))
+        self.assertNotEqual(two['status'],'probe_failed')
+        expired=projection([],first['state'],NOW+61,probe=p(samples))
+        self.assertFalse(expired['can_compare'])
+
+    def test_unknown_route_does_not_hide_confirmed_connection_failure(self):
+        events=[event(i,30+i) for i in range(3)]
+        first=projection(events,route={'certain':False})
+        second=projection(events,first['state'],NOW+15,route={'certain':False})
+        self.assertEqual(second['status'],'sustained')
+        self.assertFalse(second['can_compare'])
+        self.assertEqual(second['advice'],'先确认当前代理路由')
+
+    def test_probe_failure_is_visible_even_when_logs_are_unavailable(self):
+        probe=dict(state='ok',observed_at=NOW,interval=30,samples=[dict(at=NOW-i*30,ok=False) for i in [2,1,0]])
+        result=projection([],source={'state':'unavailable','observed_at':NOW},probe=probe)
+        self.assertEqual(result['status'],'probe_failed')
+        self.assertIsNone(result['retry_count'])
+
+    def test_epoch_change_drops_old_retry_condition(self):
+        events=[event(i,30+i) for i in range(3)]
+        first=projection(events)
+        new=projection(events,first['state'],NOW+15,started=NOW)
+        self.assertEqual(new['retry_count'],0)
+        self.assertFalse(new['can_compare'])
+
+    def test_candidate_requires_full_success_and_orders_usage_first(self):
+        def r(name,good,ms): return dict(name=name,success_count=good,sample_count=5,median_ms=ms,p90_ms=ms)
+        self.assertEqual(rank_candidates([r('current',5,1),r('partial',4,2),r('fast',5,5),r('observed',5,20)],'current',{'observed':2})['name'],'observed')
+        self.assertIsNone(rank_candidates([r('partial',4,2)],'current',{}))
+
+class LogTests(unittest.TestCase):
+    def make_db(self,directory,rows):
+        path=str(Path(directory)/'logs.sqlite')
+        with contextlib.closing(sqlite3.connect(path)) as db:
+            db.executescript('CREATE TABLE logs(id INTEGER PRIMARY KEY,ts INTEGER,ts_nanos INTEGER,target TEXT,level TEXT,feedback_log_body TEXT,thread_id TEXT,process_uuid TEXT); CREATE INDEX idx_logs_ts ON logs(ts DESC);')
+            db.executemany('INSERT INTO logs(ts,ts_nanos,target,level,feedback_log_body,thread_id,process_uuid) VALUES (?,0,?,?,?,?,?)',rows)
+            db.commit()
+        return path
+
+    def row(self,at,kind,turn=TURN):
+        target={'output':logs.TARGET_OUTPUT,'retry':logs.TARGET_RETRY,'activity':logs.TARGET_CLIENT}[kind]
+        detail={'output':'Output item item_type="reasoning" PRIVATE_CONTENT','retry':'stream disconnected: retrying PRIVATE_CONTENT','activity':'start PRIVATE_CONTENT'}[kind]
+        return (at,target,'DEBUG',f'run_sampling_request{{turn_id={turn}}}: '+detail,'thread','process')
+
+    def test_long_task_sql_window_and_retry_only_no_crash_or_content(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "logs.sqlite")
-            sqlite3.connect(path).close()
-            result = read_codex_activity(path, 1_800_000_000.0)
-            self.assertFalse(result["available"])
-            self.assertIn("不可用", result["error"])
+            path=self.make_db(directory,[self.row(NOW-1000,'activity'),self.row(NOW-2,'retry'),self.row(NOW-1,'output')])
+            result=logs.read_events(path,NOW)
+            self.assertEqual(result['state'],'ok')
+            self.assertEqual(len(result['events']),2)
+            self.assertNotIn('PRIVATE_CONTENT',str(result))
+            self.assertEqual(projection(result['events'])['status'],'recovered')
+            self.assertEqual(max(e['at'] for e in result['events']),NOW-1)
 
-    def test_sql_extracts_only_performance_metadata(self):
-        now = 1_800_000_000
+    def test_unknown_turn_keeps_retry_fact_but_cannot_infer_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "logs.sqlite")
-            connection = sqlite3.connect(path)
-            connection.executescript(
-                """
-                CREATE TABLE logs (
-                  id INTEGER PRIMARY KEY,
-                  ts INTEGER NOT NULL,
-                  ts_nanos INTEGER NOT NULL,
-                  level TEXT NOT NULL,
-                  target TEXT NOT NULL,
-                  feedback_log_body TEXT
-                );
-                CREATE INDEX idx_logs_ts ON logs(ts DESC, ts_nanos DESC, id DESC);
-                """
-            )
-            start = (
-                f"turn{{codex.turn.reasoning_effort=medium}}:"
-                f"run_sampling_request{{turn_id={TURN_A} model=gpt-5.6-sol cwd=/private/secret}}"
-            )
-            output = (
-                f"run_sampling_request{{turn_id={TURN_A}}}: "
-                "Output item item_type=\"reasoning\""
-            )
-            connection.executemany(
-                "INSERT INTO logs(ts, ts_nanos, level, target, feedback_log_body) VALUES(?,?,?,?,?)",
-                [
-                    (now - 10, 0, "TRACE", TARGET_CLIENT, start),
-                    (now - 7, 0, "DEBUG", TARGET_OUTPUT, output),
-                ],
-            )
-            connection.commit()
-            connection.close()
+            path=self.make_db(directory,[self.row(NOW-1,'retry','bad')])
+            result=logs.read_events(path,NOW)
+            self.assertEqual(result['state'],'incomplete')
+            self.assertEqual(len(result['events']),1)
+            self.assertIsNone(result['events'][0]['task'])
 
-            result = read_codex_activity(path, float(now))
-            self.assertTrue(result["active"])
-            self.assertEqual(result["model"], "gpt-5.6-sol")
-            self.assertEqual(result["reasoning_effort"], "medium")
-            self.assertEqual(result["first_output_median_seconds"], 3.0)
-            self.assertNotIn("secret", str(result))
-
-    def test_tun_states(self):
-        self.assertEqual(evaluate_tun({"tun": {"enable": False}}, "", "")["state"], "disabled")
-        enabled = evaluate_tun(
-            {"tun": {"enable": True, "device": "utun4"}},
-            "  interface: utun4\n",
-            "utun4: flags=8051<UP,POINTOPOINT>\n\tinet 198.18.0.1 --> 198.18.0.1\n",
-        )
-        self.assertEqual(enabled["state"], "enabled")
-        mismatch = evaluate_tun(
-            {"tun": {"enable": True, "device": "utun4"}},
-            "  interface: en0\n",
-            "utun4: flags=8051<UP,POINTOPOINT>\n\tinet 198.18.0.1 --> 198.18.0.1\n",
-        )
-        self.assertEqual(mismatch["state"], "unavailable")
-
+    def test_unknown_schema_degrades(self):
         with tempfile.TemporaryDirectory() as directory:
-            missing_socket = os.path.join(directory, "missing.sock")
-            missing_app = (os.path.join(directory, "Clash Verge.app"),)
-            tun = read_tun_state(missing_socket, missing_app)
-            self.assertEqual(tun["state"], "unavailable")
-            self.assertEqual(tun["detail"], "未安装 Clash Verge")
-            proxy = read_proxy_state(missing_socket, missing_app)
-            self.assertEqual(proxy["detail"], "未安装 Clash Verge")
+            path=str(Path(directory)/'empty.sqlite');sqlite3.connect(path).close()
+            self.assertEqual(logs.read_events(path,NOW)['state'],'unavailable')
 
-            os.mkdir(missing_app[0])
-            self.assertEqual(
-                read_tun_state(missing_socket, missing_app)["detail"],
-                "Clash Verge 未连接",
-            )
+class ProxyTests(unittest.TestCase):
+    def fixtures(self,group='Proxy'):
+        return {'proxies':{'Others':{'type':'Selector','now':group,'all':[group]},group:{'type':'Selector','now':'日本','all':['日本','香港','新加坡']},'日本':{'type':'Shadowsocks','id':'jp'},'香港':{'type':'Shadowsocks','id':'hk'},'新加坡':{'type':'Shadowsocks','id':'sg'}}}, {'connections':[{'metadata':{'host':'chatgpt.com'},'chains':['日本',group,'Others']}]}
+    def test_arbitrary_policy_names(self):
+        for group in ['Proxy','GPT','中文组']:
+            proxies,connections=self.fixtures(group)
+            state=proxy.resolve_proxy_state(proxies,connections)
+            self.assertTrue(state['certain'])
+            self.assertEqual(state['selector'],group)
+            self.assertEqual(proxy.resolve_gpt_proxy_context(proxies,connections)['candidates'],['日本','新加坡'])
+    def test_domain_boundary_and_absent_connections(self):
+        p,c=self.fixtures();c['connections'][0]['metadata']['host']='fakechatgpt.com'
+        self.assertFalse(proxy.resolve_proxy_state(p,c)['certain'])
+        self.assertFalse(proxy.resolve_proxy_state(p,{})['certain'])
+    def test_multiroute_and_old_connection(self):
+        p,c=self.fixtures();c['connections'].append({'metadata':{'host':'api.openai.com'},'chains':['新加坡','Proxy']})
+        self.assertFalse(proxy.resolve_proxy_state(p,c)['certain'])
+        p,c=self.fixtures();p['proxies']['Proxy']['now']='新加坡'
+        state=proxy.resolve_proxy_state(p,c)
+        self.assertTrue(state['transitioning']);self.assertFalse(state['certain'])
+    def test_tun_and_chunked_transport(self):
+        self.assertEqual(proxy.evaluate_tun({'tun':{'enable':False}},'','')['state'],'disabled')
+        self.assertEqual(proxy._decode_chunked(b'4\r\ntest\r\n0\r\n\r\n'),b'test')
 
-    def test_proxy_prefers_live_chatgpt_leaf(self):
-        result = resolve_proxy_state(
-            {"proxies": {}},
-            {"connections": [{
-                "metadata": {"host": "ws.chatgpt.com"},
-                "chains": ["🇯🇵 日本 AI ", "🔰 手动选择", "🤖 AI"],
-            }]},
-        )
-        self.assertEqual(result["name"], "🇯🇵 日本 AI")
-        self.assertEqual(result["source"], "connection")
+class CoordinatorTests(unittest.TestCase):
+    def test_repeated_poll_deduplicates_and_epoch_resets_same_name(self):
+        route={'available':True,'certain':True,'environment':'env1','node_id':'node1','name':'same','selected_name':'same','connection_ids':[]}
+        source={'state':'ok','observed_at':NOW,'events':[event(1,0,'retry')]}
+        with tempfile.TemporaryDirectory() as directory,patch.object(coordinator,'read_tun_state',return_value={'state':'enabled'}),patch.object(coordinator,'read_events',return_value=source),patch.object(coordinator,'read_proxy_snapshot',return_value=(route,{},{})):
+            path=Path(directory)/'state.json'
+            first=coordinator.collect({'session_id':'one'},path=path,now=NOW)
+            second=coordinator.collect({'session_id':'one'},path=path,now=NOW+15)
+            self.assertEqual(second['diagnosis']['history_count'],1)
+            self.assertEqual(first['epoch'],second['epoch'])
+            route['node_id']='newnode'
+            third=coordinator.collect({'session_id':'one'},path=path,now=NOW+30)
+            self.assertNotEqual(third['epoch'],first['epoch'])
+            self.assertEqual(third['diagnosis']['retry_count'],0)
+            fourth=coordinator.collect({'session_id':'one'},path=path,now=NOW+100)
+            self.assertNotEqual(fourth['epoch'],third['epoch'])
+            self.assertEqual(os.stat(path).st_mode&0o777,0o600)
 
-    def test_proxy_recursively_resolves_ai_policy(self):
-        proxies = {
-            "🤖 AI": {"now": "🔰 手动选择"},
-            "🔰 手动选择": {"now": "🇯🇵 日本 AI"},
-            "🇯🇵 日本 AI": {"type": "Vless"},
-        }
-        result = resolve_proxy_state({"proxies": proxies}, {"connections": []})
-        self.assertEqual(result["name"], "🇯🇵 日本 AI")
-        self.assertEqual(result["selected_name"], "🇯🇵 日本 AI")
-        self.assertEqual(result["source"], "policy")
+class BenchmarkBoundaryTests(unittest.TestCase):
+    def test_live_node_changed_before_benchmark_is_rejected(self):
+        route={'available':True,'certain':True,'identity_confirmed':True,'environment':'env','selected_name':'B','node_id':'idB'}
+        old={'epoch':'A-epoch','environment':'env','selected_name':'A','node_id':'idA'}
+        context={'available':True,'candidates':['A','B'],'current_name':'B'}
+        with patch.object(coordinator,'load_state',return_value=old),patch.object(coordinator,'read_proxy_snapshot',return_value=(route,{},{})),patch.object(coordinator,'resolve_gpt_proxy_context',return_value=context),patch.object(coordinator,'probe_node') as probe:
+            result=coordinator.benchmark({'epoch':'A-epoch'})
+            self.assertIsNone(result['candidate'])
+            probe.assert_not_called()
 
-    def test_proxy_keeps_selected_and_active_nodes_separate(self):
-        proxies = {
-            "🤖 AI": {"now": "🔰 手动选择"},
-            "🔰 手动选择": {"now": "🇯🇵 日本 01"},
-            "🇯🇵 日本 01": {"type": "Vless"},
-        }
-        result = resolve_proxy_state(
-            {"proxies": proxies},
-            {"connections": [{
-                "metadata": {"host": "chatgpt.com"},
-                "chains": ["🇺🇸 美国 AI", "🔰 手动选择", "🤖 AI"],
-            }]},
-        )
-        self.assertEqual(result["name"], "🇯🇵 日本 01")
-        self.assertEqual(result["selected_name"], "🇯🇵 日本 01")
-        self.assertEqual(result["active_name"], "🇺🇸 美国 AI")
-        self.assertTrue(result["transitioning"])
+    def test_environment_changes_during_benchmark_drop_result(self):
+        route={'available':True,'certain':True,'identity_confirmed':True,'environment':'env','selected_name':'A','node_id':'idA'}
+        old={'epoch':'epoch','environment':'env','selected_name':'A','node_id':'idA'}
+        context={'available':True,'candidates':['B'],'current_name':'A'}
+        candidate=dict(name='B',sample_count=5,success_count=5,median_ms=10,p90_ms=20)
+        after={**route,'environment':'new'}
+        with patch.object(coordinator,'load_state',return_value=old),patch.object(coordinator,'read_proxy_snapshot',side_effect=[(route,{},{}),(after,{},{})]),patch.object(coordinator,'resolve_gpt_proxy_context',return_value=context),patch.object(coordinator,'probe_node',return_value=candidate):
+            result=coordinator.benchmark({'epoch':'epoch'})
+            self.assertIsNone(result['candidate'])
+            self.assertIn('丢弃',result['error'])
 
-    def test_gpt_context_uses_deep_selector_and_excludes_hong_kong(self):
-        proxies = {
-            "🤖 AI": {"type": "Selector", "now": "🔰 手动选择", "all": ["🔰 手动选择"]},
-            "🔰 手动选择": {
-                "type": "Selector",
-                "now": "🇺🇸 美国 AI",
-                "all": ["♻️ 自动选择", "🎯 Direct", "🇭🇰 香港 01", "🇸🇬 新加坡 01", "🇺🇸 美国 AI"],
-            },
-            "♻️ 自动选择": {"type": "URLTest", "now": "🇸🇬 新加坡 01", "all": ["🇸🇬 新加坡 01"]},
-            "🎯 Direct": {"type": "Direct"},
-            "🇭🇰 香港 01": {"type": "Vless"},
-            "🇸🇬 新加坡 01": {"type": "Vless"},
-            "🇺🇸 美国 AI": {"type": "Vless"},
-        }
-        result = resolve_gpt_proxy_context({"proxies": proxies})
-        self.assertTrue(result["available"])
-        self.assertEqual(result["selector"], "🔰 手动选择")
-        self.assertEqual(result["current_name"], "🇺🇸 美国 AI")
-        self.assertEqual(result["candidates"], ["🇸🇬 新加坡 01", "🇺🇸 美国 AI"])
+    def test_missing_node_id_disables_node_advice(self):
+        events=[event(i,30+i) for i in range(3)]
+        result=projection(events,route={'certain':True,'identity_confirmed':False})
+        self.assertFalse(projection(events,result['state'],NOW+15,route={'certain':True,'identity_confirmed':False})['can_compare'])
 
-    def test_gpt_recommendation_requires_meaningful_gain(self):
-        results = [
-            {"name": "🇸🇬 新加坡 01", "median_ms": 130, "p90_ms": 150, "max_ms": 150, "success_count": 5, "sample_count": 5},
-            {"name": "🇯🇵 日本 01", "median_ms": 170, "p90_ms": 180, "max_ms": 180, "success_count": 5, "sample_count": 5},
-            {"name": "🇺🇸 美国 AI", "median_ms": 1200, "p90_ms": 3000, "max_ms": 3000, "success_count": 5, "sample_count": 5},
-        ]
-        qualities = {
-            "🇺🇸 美国 AI": {"status": "unstable", "turn_count": 10},
-            "🇯🇵 日本 01": {"status": "stable", "turn_count": 20, "first_attempt_success_pct": 100},
-            "🇸🇬 新加坡 01": {"status": "observing", "turn_count": 2},
-        }
-        picked = choose_gpt_recommendation("🇺🇸 美国 AI", results, qualities)
-        self.assertEqual(picked["recommended"]["name"], "🇯🇵 日本 01")
-        self.assertEqual(picked["recommendation_kind"], "stable")
+    def test_corrupt_cache_recovers_without_crash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'state.json'
+            path.write_text('{"version":2,"events":"wrong"}')
+            self.assertEqual(coordinator.load_state(path),{})
 
-        stable_current = {**qualities, "🇺🇸 美国 AI": {"status": "stable", "turn_count": 20}}
-        quiet = choose_gpt_recommendation("🇺🇸 美国 AI", results, stable_current)
-        self.assertIsNone(quiet["recommended"])
-        self.assertIsNone(quiet["trial"])
-
-    def test_unstable_current_only_offers_unverified_candidate_as_trial(self):
-        results = [
-            {"name": "current", "median_ms": 300, "p90_ms": 400, "max_ms": 400, "success_count": 5, "sample_count": 5},
-            {"name": "candidate", "median_ms": 100, "p90_ms": 120, "max_ms": 120, "success_count": 5, "sample_count": 5},
-        ]
-        picked = choose_gpt_recommendation(
-            "current", results,
-            {"current": {"status": "unstable", "turn_count": 5},
-             "candidate": {"status": "observing", "turn_count": 0}},
-        )
-        self.assertIsNone(picked["recommended"])
-        self.assertEqual(picked["trial"]["name"], "candidate")
-        self.assertEqual(picked["recommendation_kind"], "trial")
-
-    def test_partial_probe_cannot_be_recommended(self):
-        results = [
-            {"name": "current", "median_ms": 500, "p90_ms": 600, "success_count": 5, "sample_count": 5},
-            {"name": "flaky", "median_ms": 50, "p90_ms": 70, "success_count": 4, "sample_count": 5},
-        ]
-        picked = choose_gpt_recommendation(
-            "current", results,
-            {"current": {"status": "unstable"},
-             "flaky": {"status": "stable", "first_attempt_success_pct": 100}},
-        )
-        self.assertIsNone(picked["recommended"])
-        self.assertIsNone(picked["trial"])
-
-    def test_quality_history_stable_and_unstable_states(self):
-        now = 1_800_000_000.0
-        stable_history = {"version": 1, "created_at": now - 1000, "turns": {}, "switches": []}
-        stable_turns = [
-            {"turn_id": f"stable-{index}", "start_at": now - index, "last_seen_at": now - index,
-             "has_output": True, "retry_count": 0}
-            for index in range(10)
-        ]
-        update_quality_history(stable_history, "日本", stable_turns, now)
-        stable = summarize_node_quality(stable_history, "日本", now)
-        self.assertEqual(stable["status"], "stable")
-        self.assertEqual(stable["first_attempt_success_pct"], 100)
-
-        unstable_history = {"version": 1, "created_at": now - 1000, "turns": {}, "switches": []}
-        unstable_turns = [
-            {"turn_id": "bad", "start_at": now - 10, "last_seen_at": now - 5,
-             "has_output": True, "retry_count": 3, "opening_retry_count": 3,
-             "tls_eof_count": 2}
-        ]
-        update_quality_history(unstable_history, "新加坡", unstable_turns, now)
-        unstable = summarize_node_quality(unstable_history, "新加坡", now)
-        self.assertEqual(unstable["status"], "unstable")
-        self.assertEqual(unstable["max_retries_per_turn"], 3)
-
-    def test_turn_overlapping_switch_grace_is_ignored(self):
-        now = 1_800_000_000.0
-        history = {
-            "version": 1,
-            "created_at": now - 1000,
-            "turns": {},
-            "switches": [{"at": now - 10, "from": "新加坡", "to": "日本"}],
-        }
-        turns = [{
-            "turn_id": "during-switch", "start_at": now - 20, "last_seen_at": now - 5,
-            "has_output": True, "retry_count": 3,
-        }]
-        update_quality_history(history, "日本", turns, now)
-        self.assertTrue(history["turns"]["during-switch"]["ignored_after_switch"])
-        self.assertEqual(summarize_node_quality(history, "新加坡", now)["turn_count"], 0)
-
-    def test_manual_selector_change_assigns_later_turns_to_current_node(self):
-        now = 1_800_000_000.0
-        history = {
-            "version": 1,
-            "created_at": now - 1000,
-            "turns": {},
-            "switches": [{
-                "at": now - 500,
-                "from": "日本 AI",
-                "to": "日本 01",
-                "source": "app",
-            }],
-        }
-        # 首次看到 Clash 被手动切回日本 AI：跨切换的活动轮次不参与质量统计。
-        active = [{
-            "turn_id": "during-manual-switch",
-            "start_at": now - 10,
-            "last_seen_at": now - 2,
-            "has_output": True,
-            "retry_count": 0,
-        }]
-        update_quality_history(history, "日本 AI", active, now)
-        self.assertEqual(history["selected_node"], "日本 AI")
-        self.assertEqual(history["switches"][-1]["source"], "observed")
-        self.assertTrue(history["turns"]["during-manual-switch"]["ignored_after_switch"])
-
-        # 切换后开始的新轮次必须归当前节点，不能再被旧 target 覆盖。
-        later = [{
-            "turn_id": "after-manual-switch",
-            "start_at": now + 35,
-            "last_seen_at": now + 38,
-            "has_output": True,
-            "retry_count": 0,
-        }]
-        update_quality_history(history, "日本 AI", later, now + 40)
-        self.assertEqual(history["turns"]["after-manual-switch"]["node"], "日本 AI")
-        self.assertEqual(summarize_node_quality(history, "日本 AI", now + 40)["turn_count"], 1)
-
-    def test_old_switch_target_does_not_override_current_node(self):
-        now = 1_800_000_000.0
-        history = {
-            "version": 1,
-            "created_at": now - 1000,
-            "selected_node": "日本 AI",
-            "turns": {},
-            "switches": [{"at": now - 500, "from": "日本 AI", "to": "日本 01"}],
-        }
-        turns = [{
-            "turn_id": "new-current-turn",
-            "start_at": now - 5,
-            "last_seen_at": now - 1,
-            "has_output": True,
-            "retry_count": 0,
-        }]
-        update_quality_history(history, "日本 AI", turns, now)
-        self.assertEqual(history["turns"]["new-current-turn"]["node"], "日本 AI")
-
-    def test_quality_node_names_ignore_surrounding_whitespace(self):
-        now = 1_800_000_000.0
-        history = {
-            "version": 1,
-            "created_at": now - 100,
-            "turns": {
-                "sample": {
-                    "node": "日本 AI ",
-                    "start_at": now - 10,
-                    "last_seen_at": now - 5,
-                    "has_output": True,
-                    "retry_count": 0,
-                }
-            },
-            "switches": [],
-        }
-        quality = summarize_node_quality(history, " 日本 AI", now)
-        self.assertEqual(quality["node"], "日本 AI")
-        self.assertEqual(quality["turn_count"], 1)
-
-    def test_decodes_chunked_mihomo_response(self):
-        self.assertEqual(_decode_chunked(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n"), b"Wikipedia")
-
-
-if __name__ == "__main__":
-    unittest.main()
+if __name__=='__main__':unittest.main()

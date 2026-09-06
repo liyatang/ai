@@ -1,925 +1,195 @@
 #!/usr/bin/env python3
-"""Codex 状态本地诊断数据层。
-
-只读取 Codex 性能元数据（时间、模型、reasoning、事件类型、重试）与
-Clash/mihomo 本机状态；不输出或缓存提示词、工具参数、工作路径。
-"""
-
+"""Version 2 diagnostics coordinator. Input/output contain performance metadata only."""
 from __future__ import annotations
-
 import argparse
 import concurrent.futures
 import contextlib
 import fcntl
+import hashlib
 import json
+import math
 import os
-import re
-import socket
-import sqlite3
-import statistics
-import subprocess
+import sys
 import time
-import urllib.parse
-from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from status_logs import read_events, LOG_PATH
+from status_proxy import read_proxy_snapshot, read_tun_state, resolve_gpt_proxy_context, probe_node
+from status_engine import project, rank_candidates
+
+ROOT = Path(os.path.expanduser('~/.config/quota-widget'))
+STATE_PATH = ROOT/'observations-v2.json'
 
 
-LOG_PATH = os.path.expanduser("~/.codex/logs_2.sqlite")
-QUALITY_PATH = os.path.expanduser("~/.config/quota-widget/gpt_node_quality.json")
-MIHOMO_SOCKET = "/tmp/verge/verge-mihomo.sock"
-CLASH_APP_PATHS = (
-    "/Applications/Clash Verge.app",
-    "/Applications/Clash Verge Rev.app",
-    os.path.expanduser("~/Applications/Clash Verge.app"),
-    os.path.expanduser("~/Applications/Clash Verge Rev.app"),
-)
-ACTIVITY_SECONDS = 300
-MAX_ROWS = 20_000
-GPT_PROBE_URL = "https://chatgpt.com/cdn-cgi/trace"
-GPT_PROBE_ROUNDS = 5
-GPT_PROBE_TIMEOUT_MS = 6_000
-GROUP_PROXY_TYPES = frozenset(("Selector", "URLTest", "Fallback", "LoadBalance"))
-QUALITY_WINDOW_SECONDS = 86_400
-QUALITY_MAX_TURNS = 20
-QUALITY_MIN_STABLE_TURNS = 10
-SWITCH_GRACE_SECONDS = 30
-
-TARGET_WEBSOCKET = "codex_api::endpoint::responses_websocket"
-TARGET_CLIENT = "codex_core::client"
-TARGET_STARTS = frozenset((TARGET_WEBSOCKET, TARGET_CLIENT))
-TARGET_OUTPUT = "codex_core::stream_events_utils"
-TARGET_RETRY = "codex_core::responses_retry"
-
-@dataclass
-class TurnStart:
-    at: float
-    model: str | None
-    reasoning_effort: str | None
-
-
-def _timestamp(seconds: int, nanos: int) -> float:
-    return float(seconds) + float(nanos) / 1_000_000_000
-
-
-def _percentile(values: list[float], fraction: float) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * fraction)))
-    return ordered[index]
-
-
-def analyze_codex_rows(
-    rows: list[tuple[Any, ...]], now: float
-) -> dict[str, Any]:
-    """把已经过滤为性能元数据的日志行聚合为最近五分钟活动。"""
-    cutoff = now - ACTIVITY_SECONDS
-    starts: dict[str, TurnStart] = {}
-    first_outputs: dict[str, float] = {}
-    last_outputs: dict[str, float] = {}
-    retries: dict[str, int] = {}
-    retry_times: dict[str, list[float]] = {}
-    tls_eofs: dict[str, int] = {}
-    closed_connections: dict[str, int] = {}
-
-    for row in rows:
-        seconds, nanos, target, level, turn_id, model, effort = row[:7]
-        body = str(row[7] or "") if len(row) > 7 else ""
-        if not re.fullmatch(r"[0-9a-f-]{36}", turn_id or ""):
-            continue
-        at = _timestamp(seconds, nanos)
-
-        if target in TARGET_STARTS:
-            previous = starts.get(turn_id)
-            if previous is None or at < previous.at:
-                starts[turn_id] = TurnStart(at=at, model=model, reasoning_effort=effort)
-        elif target == TARGET_OUTPUT and level == "DEBUG":
-            first_outputs[turn_id] = min(first_outputs.get(turn_id, at), at)
-            last_outputs[turn_id] = max(last_outputs.get(turn_id, at), at)
-        elif target == TARGET_RETRY:
-            retries[turn_id] = retries.get(turn_id, 0) + 1
-            retry_times.setdefault(turn_id, []).append(at)
-            if "unexpected-eof" in body or "close_notify" in body:
-                tls_eofs[turn_id] = tls_eofs.get(turn_id, 0) + 1
-            if "Connection closed" in body or "connection closed" in body:
-                closed_connections[turn_id] = closed_connections.get(turn_id, 0) + 1
-
-    active_ids = {
-        turn_id for turn_id, start in starts.items() if start.at >= cutoff
-    } | {
-        turn_id for turn_id, output_at in last_outputs.items() if output_at >= cutoff
-    }
-    waits: list[float] = []
-    for turn_id in active_ids:
-        start = starts.get(turn_id)
-        if start is None:
-            continue
-        output_at = first_outputs.get(turn_id)
-        if output_at is None:
-            continue
-        wait = output_at - start.at
-        if 0 <= wait <= ACTIVITY_SECONDS:
-            waits.append(wait)
-
-    active_starts = [starts[turn_id] for turn_id in active_ids if turn_id in starts]
-    latest = max(active_starts, key=lambda item: item.at) if active_starts else None
-    retry_count = sum(retries.get(turn_id, 0) for turn_id in active_ids)
-    eligible_ids = {
-        turn_id for turn_id in active_ids
-        if turn_id in first_outputs or retries.get(turn_id, 0) > 0
-    }
-    retry_turn_count = sum(1 for turn_id in eligible_ids if retries.get(turn_id, 0) > 0)
-    first_attempt_success_count = sum(
-        1 for turn_id in eligible_ids
-        if turn_id in first_outputs and retries.get(turn_id, 0) == 0
-    )
-    first_attempt_success_pct = (
-        round(first_attempt_success_count / len(eligible_ids) * 100)
-        if eligible_ids else None
-    )
-    ordered_eligible = sorted(
-        eligible_ids,
-        key=lambda turn_id: starts.get(turn_id, TurnStart(0, None, None)).at,
-        reverse=True,
-    )
-    stable_streak = 0
-    for turn_id in ordered_eligible:
-        if turn_id in first_outputs and retries.get(turn_id, 0) == 0:
-            stable_streak += 1
-        else:
-            break
-    turn_records = []
-    for turn_id in active_ids:
-        start = starts.get(turn_id)
-        if start is None:
-            continue
-        turn_retry_times = retry_times.get(turn_id, [])
-        turn_records.append({
-            "turn_id": turn_id,
-            "start_at": round(start.at, 6),
-            "last_seen_at": round(max(
-                [start.at, first_outputs.get(turn_id, start.at), *turn_retry_times]
-            ), 6),
-            "has_output": turn_id in first_outputs,
-            "retry_count": retries.get(turn_id, 0),
-            "opening_retry_count": sum(1 for at in turn_retry_times if at - start.at <= 15),
-            "tls_eof_count": tls_eofs.get(turn_id, 0),
-            "connection_closed_count": closed_connections.get(turn_id, 0),
-        })
-    return {
-        "available": True,
-        "active": bool(active_ids),
-        "window_seconds": ACTIVITY_SECONDS,
-        "turn_count": len(active_ids),
-        "sample_count": len(waits),
-        "first_output_median_seconds": round(statistics.median(waits), 3) if waits else None,
-        "first_output_p90_seconds": round(_percentile(waits, 0.9), 3) if waits else None,
-        "retry_count": retry_count,
-        "retry_turn_count": retry_turn_count,
-        "first_attempt_success_count": first_attempt_success_count,
-        "first_attempt_success_pct": first_attempt_success_pct,
-        "max_retries_per_turn": max((retries.get(turn_id, 0) for turn_id in eligible_ids), default=0),
-        "opening_retry_count": sum(
-            1 for turn_id in eligible_ids for at in retry_times.get(turn_id, [])
-            if at - starts[turn_id].at <= 15
-        ),
-        "tls_eof_count": sum(tls_eofs.get(turn_id, 0) for turn_id in eligible_ids),
-        "connection_closed_count": sum(
-            closed_connections.get(turn_id, 0) for turn_id in eligible_ids
-        ),
-        "stable_streak": stable_streak,
-        "model": latest.model if latest else None,
-        "reasoning_effort": latest.reasoning_effort if latest else None,
-        "_turns": turn_records,
-    }
-
-
-def read_codex_activity(path: str = LOG_PATH, now: float | None = None) -> dict[str, Any]:
-    now = time.time() if now is None else now
-    if not os.path.exists(path):
-        return {"available": False, "active": False, "error": "未找到 Codex 日志"}
-
-    cutoff = int(now) - ACTIVITY_SECONDS - 60
-    query = """
-        SELECT
-          ts,
-          ts_nanos,
-          target,
-          level,
-          substr(
-            feedback_log_body,
-            instr(feedback_log_body, 'run_sampling_request{turn_id=')
-              + length('run_sampling_request{turn_id='),
-            36
-          ) AS turn_id,
-          CASE WHEN target IN (?, ?) THEN
-            substr(
-              feedback_log_body,
-              instr(feedback_log_body, ' model=') + length(' model='),
-              instr(substr(feedback_log_body, instr(feedback_log_body, ' model=') + length(' model=')), ' ') - 1
-            )
-          END AS model,
-          CASE WHEN target IN (?, ?) THEN
-            substr(
-              feedback_log_body,
-              instr(feedback_log_body, 'codex.turn.reasoning_effort=')
-                + length('codex.turn.reasoning_effort='),
-              instr(substr(
-                feedback_log_body,
-                instr(feedback_log_body, 'codex.turn.reasoning_effort=')
-                  + length('codex.turn.reasoning_effort=')
-              ), '}') - 1
-            )
-          END AS reasoning_effort,
-          CASE WHEN target = ? THEN feedback_log_body END AS retry_detail
-        FROM logs INDEXED BY idx_logs_ts
-        WHERE ts >= ?
-          AND (
-            (target IN (?, ?) AND instr(feedback_log_body, 'run_sampling_request{turn_id=') > 0)
-            OR
-            (target = ? AND level = 'DEBUG'
-             AND instr(feedback_log_body, 'Output item item_type=') > 0)
-            OR
-            (target = ? AND instr(feedback_log_body, 'stream disconnected') > 0)
-          )
-        ORDER BY ts ASC, ts_nanos ASC, id ASC
-        LIMIT ?
-    """
+def load_state(path=STATE_PATH):
     try:
-        uri = f"file:{path}?mode=ro&immutable=0"
-        with sqlite3.connect(uri, uri=True, timeout=0.1) as connection:
-            connection.execute("PRAGMA query_only = ON")
-            deadline = time.monotonic() + 0.1
-            connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 1_000)
-            rows = connection.execute(
-                query,
-                (
-                    TARGET_WEBSOCKET,
-                    TARGET_CLIENT,
-                    TARGET_WEBSOCKET,
-                    TARGET_CLIENT,
-                    TARGET_RETRY,
-                    cutoff,
-                    TARGET_WEBSOCKET,
-                    TARGET_CLIENT,
-                    TARGET_OUTPUT,
-                    TARGET_RETRY,
-                    MAX_ROWS,
-                ),
-            ).fetchall()
-        return analyze_codex_rows(rows, now)
-    except (sqlite3.Error, OSError) as exc:
-        return {"available": False, "active": False, "error": f"Codex 日志不可用: {exc}"}
+        state=json.loads(Path(path).read_text())
+        if not isinstance(state,dict) or state.get('version')!=2:
+            return {}
+        if not isinstance(state.get('events',[]),list) or not isinstance(state.get('diagnosis_state',{}),dict):
+            return {}
+        for key in ('updated','epoch_started'):
+            if key in state and (not isinstance(state[key],(int,float)) or not math.isfinite(state[key])):
+                return {}
+        for e in state.get('events',[]):
+            if not isinstance(e,dict) or not isinstance(e.get('id'),str) or e.get('kind') not in ('retry','output','activity') or not isinstance(e.get('at'),(int,float)) or not math.isfinite(e['at']):
+                return {}
+        return state
+    except (OSError,ValueError,AttributeError):
+        return {}
 
 
-def _unix_http_request(
-    socket_path: str,
-    path: str,
-    timeout: float = 0.25,
-    method: str = "GET",
-    payload: dict[str, Any] | None = None,
-) -> tuple[int, bytes]:
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client.settimeout(timeout)
+def save_state(state,path=STATE_PATH):
+    path=Path(path)
+    temporary=path.with_name(path.name+f'.{os.getpid()}.tmp')
     try:
-        client.connect(socket_path)
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else b""
-        headers = [
-            f"{method} {path} HTTP/1.1",
-            "Host: localhost",
-            "Connection: close",
-        ]
-        if body:
-            headers.extend(("Content-Type: application/json", f"Content-Length: {len(body)}"))
-        client.sendall(("\r\n".join(headers) + "\r\n\r\n").encode() + body)
-        chunks: list[bytes] = []
-        while True:
-            chunk = client.recv(65_536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        raw = b"".join(chunks)
-        headers, body = raw.split(b"\r\n\r\n", 1)
-        status_line = headers.split(b"\r\n", 1)[0]
-        status = int(status_line.split(b" ", 2)[1])
-        if b"transfer-encoding: chunked" in headers.lower():
-            body = _decode_chunked(body)
-        if status >= 400:
-            raise OSError(f"mihomo HTTP {status}")
-        return status, body
+        fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+        with os.fdopen(fd,'w') as out:
+            json.dump(state,out,ensure_ascii=False,allow_nan=False)
+        os.replace(temporary,path)
+        os.chmod(path,0o600)
     finally:
-        client.close()
-
-
-def _unix_http_json(socket_path: str, path: str, timeout: float = 0.25) -> dict[str, Any]:
-    _, body = _unix_http_request(socket_path, path, timeout=timeout)
-    return json.loads(body.decode("utf-8"))
-
-
-def _decode_chunked(data: bytes) -> bytes:
-    output = bytearray()
-    offset = 0
-    while offset < len(data):
-        line_end = data.find(b"\r\n", offset)
-        if line_end < 0:
-            raise ValueError("invalid chunked response")
-        size_text = data[offset:line_end].split(b";", 1)[0]
-        size = int(size_text, 16)
-        offset = line_end + 2
-        if size == 0:
-            return bytes(output)
-        end = offset + size
-        if end > len(data):
-            raise ValueError("truncated chunked response")
-        output.extend(data[offset:end])
-        offset = end + 2
-    raise ValueError("unterminated chunked response")
-
-
-def _run(command: list[str], timeout: float = 0.3) -> str:
-    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
-    return result.stdout if result.returncode == 0 else ""
-
-
-def evaluate_tun(config: dict[str, Any], route_output: str, interface_output: str) -> dict[str, Any]:
-    tun = config.get("tun") or {}
-    if not tun.get("enable"):
-        return {"state": "disabled", "detail": "未开启"}
-
-    device = str(tun.get("device") or "").strip()
-    route_match = re.search(r"^\s*interface:\s*(\S+)", route_output, re.MULTILINE)
-    route_device = route_match.group(1) if route_match else ""
-    interface_up = "<UP," in interface_output or "<UP>" in interface_output
-    has_tun_address = bool(re.search(r"\binet\s+198\.18\.", interface_output))
-
-    if not device or route_device != device or not interface_up or not has_tun_address:
-        return {"state": "unavailable", "detail": "配置与实际路由不一致"}
-    return {"state": "enabled", "detail": f"已开启 · {device}"}
-
-
-def clash_unavailable_detail(app_paths: tuple[str, ...] = CLASH_APP_PATHS) -> str:
-    if any(os.path.exists(path) for path in app_paths):
-        return "Clash Verge 未连接"
-    return "未安装 Clash Verge"
-
-
-def read_tun_state(
-    socket_path: str = MIHOMO_SOCKET,
-    app_paths: tuple[str, ...] = CLASH_APP_PATHS,
-) -> dict[str, Any]:
-    if not os.path.exists(socket_path):
-        return {"state": "unavailable", "detail": clash_unavailable_detail(app_paths)}
-    try:
-        config = _unix_http_json(socket_path, "/configs")
-        tun = config.get("tun") or {}
-        device = str(tun.get("device") or "utun4")
-        route_output = _run(["/sbin/route", "-n", "get", "198.18.0.10"])
-        interface_output = _run(["/sbin/ifconfig", device]) if device else ""
-        return evaluate_tun(config, route_output, interface_output)
-    except (OSError, ValueError, KeyError, json.JSONDecodeError, subprocess.SubprocessError):
-        return {"state": "unavailable", "detail": "TUN 状态不可用"}
-
-
-def resolve_proxy_state(proxies_payload: dict[str, Any], connections_payload: dict[str, Any]) -> dict[str, Any]:
-    """同时返回 selector 选中节点与现有 ChatGPT 活连接的实际叶子节点。"""
-    connections = connections_payload.get("connections") or []
-    active_name = None
-    for connection in connections:
-        metadata = connection.get("metadata") or {}
-        host = str(metadata.get("host") or "").lower()
-        if "chatgpt" not in host and "openai" not in host:
-            continue
-        chains = [str(item).strip() for item in (connection.get("chains") or []) if str(item).strip()]
-        if chains:
-            active_name = chains[0]
-            break
-
-    proxies = proxies_payload.get("proxies") or {}
-    candidates = [
-        name for name in proxies
-        if re.search(r"(^|\W)(ai|openai|chatgpt)(\W|$)", name, re.IGNORECASE)
-    ]
-    candidates.sort(key=lambda name: (0 if "🤖" in name else 1, len(name)))
-    if not candidates:
-        return {
-            "available": active_name is not None,
-            "name": active_name,
-            "selected_name": None,
-            "active_name": active_name,
-            "transitioning": False,
-            "source": "connection" if active_name else "unavailable",
-        }
-
-    current = candidates[0]
-    visited: set[str] = set()
-    selected_name = None
-    while current and current not in visited:
-        visited.add(current)
-        item = proxies.get(current) or {}
-        selected = str(item.get("now") or "").strip()
-        if not selected:
-            break
-        if selected not in proxies or not (proxies.get(selected) or {}).get("now"):
-            selected_name = selected
-            break
-        current = selected
-    name = selected_name or active_name
-    return {
-        "available": name is not None,
-        "name": name,
-        "selected_name": selected_name,
-        "active_name": active_name,
-        "transitioning": bool(
-            selected_name and active_name and selected_name.strip() != active_name.strip()
-        ),
-        "source": "policy" if selected_name else ("connection" if active_name else "unavailable"),
-    }
-
-
-def resolve_gpt_proxy_context(proxies_payload: dict[str, Any]) -> dict[str, Any]:
-    """解析 GPT 策略链中可安全切换的最深 Selector 及其叶子节点。"""
-    proxies = proxies_payload.get("proxies") or {}
-    ai_groups = [
-        name for name, item in proxies.items()
-        if (item or {}).get("type") == "Selector"
-        and re.search(r"(^|\W)(ai|openai|chatgpt)(\W|$)", name, re.IGNORECASE)
-    ]
-    ai_groups.sort(key=lambda name: (0 if "🤖" in name else 1, len(name)))
-    if not ai_groups:
-        return {"available": False, "error": "未找到 GPT 代理策略组"}
-
-    current = ai_groups[0]
-    selector = current
-    visited: set[str] = set()
-    while current and current not in visited:
-        visited.add(current)
-        item = proxies.get(current) or {}
-        if item.get("type") == "Selector":
-            selector = current
-        selected = str(item.get("now") or "")
-        if not selected.strip():
-            break
-        current = selected
-
-    selector_item = proxies.get(selector) or {}
-    candidates = []
-    for raw_name in selector_item.get("all") or []:
-        name = str(raw_name)
-        display_name = name.strip()
-        item = proxies.get(name) or {}
-        if not display_name or item.get("type") in GROUP_PROXY_TYPES or item.get("all"):
-            continue
-        if re.search(r"香港|hong\s*kong|\bhk\b", display_name, re.IGNORECASE):
-            continue
-        if re.search(r"direct|reject|pass|直连", display_name, re.IGNORECASE) and "美国" not in display_name:
-            continue
-        candidates.append(name)
-
-    if not candidates:
-        return {"available": False, "error": "没有可测速的非香港 GPT 节点"}
-    return {
-        "available": True,
-        "selector": selector,
-        "current_name": current if current else None,
-        "candidates": candidates,
-    }
-
-
-def load_quality_history(
-    path: str = QUALITY_PATH, now: float | None = None
-) -> dict[str, Any]:
-    current = time.time() if now is None else now
-    try:
-        with open(path, encoding="utf-8") as file:
-            payload = json.load(file)
-        if not isinstance(payload, dict) or payload.get("version") != 1:
-            raise ValueError("unsupported quality history")
-        payload.setdefault("created_at", current)
-        payload.setdefault("turns", {})
-        payload.setdefault("switches", [])
-        payload.setdefault("selected_node", None)
-        return payload
-    except (OSError, ValueError, json.JSONDecodeError):
-        return {
-            "version": 1,
-            "created_at": current,
-            "updated": current,
-            "turns": {},
-            "switches": [],
-            "selected_node": None,
-        }
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
 
 
 @contextlib.contextmanager
-def quality_history_lock(path: str = QUALITY_PATH):
-    directory = os.path.dirname(path)
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    descriptor = os.open(f"{path}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+def state_lock(path=STATE_PATH):
+    Path(path).parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    fd=os.open(str(path)+'.lock',os.O_CREAT|os.O_RDWR,0o600)
+    deadline=time.monotonic()+.5
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        while True:
+            try:
+                fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic()>deadline:
+                    raise TimeoutError('observation lock busy')
+                time.sleep(.02)
         yield
     finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
+        os.close(fd)
 
 
-def save_quality_history(history: dict[str, Any], path: str = QUALITY_PATH) -> None:
-    directory = os.path.dirname(path)
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    temporary = f"{path}.tmp-{os.getpid()}"
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+def collect(payload=None,log_path=LOG_PATH,path=STATE_PATH,now=None):
+    payload=payload or {}
+    now=time.time() if now is None else now
+    config={}
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
-            json.dump(history, file, ensure_ascii=False, separators=(",", ":"))
-        os.replace(temporary, path)
-        os.chmod(path, 0o600)
-    except BaseException:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
+        config=json.loads((ROOT/'config.json').read_text()).get('diagnostics') or {}
+    except (OSError,ValueError):
+        pass
+    proxy,_,_=read_proxy_snapshot(configured_group=config.get('proxy_group'))
+    source=read_events(log_path,now)
+    tun=read_tun_state()
+    with state_lock(path):
+        state=load_state(path)
+        prior=state.get('diagnosis_state') or {}
+        identity=[payload.get('session_id','standalone'),proxy.get('environment'),proxy.get('node_id'),proxy.get('selected_name'),proxy.get('certain')]
+        route_key=hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:24]
+        changed=state.get('route_key')!=route_key or now-state.get('updated',0)>60
+        started=now if changed else state.get('epoch_started',now)
+        epoch=hashlib.sha256(f'{route_key}:{started}'.encode()).hexdigest()[:24] if changed else state['epoch']
+        # On first launch keep existing event times for history, never invent their route attribution.
+        old_ids=set(state.get('connection_ids') or [])
+        if state.get('environment') and state['environment']!=proxy.get('environment'):
+            state['retired_connections']=list(old_ids)
+        retired=set(state.get('retired_connections') or []) & set(proxy.get('connection_ids') or [])
+        if retired:
+            proxy={**proxy,'certain':False,'transitioning':True,'detail':'配置已变化，旧连接收尾'}
+        events={e['id']:e for e in state.get('events',[]) if now-86400<=e.get('at',0)<=now}
+        for e in source['events']:
+            events[e['id']]=e
+        recent_tasks={}
+        for e in events.values():
+            if e['kind']!='retry' and e['at']>=now-360:
+                key=(e.get('task'),e['kind'])
+                if e['at']>=recent_tasks.get(key,{}).get('at',0):
+                    recent_tasks[key]=e
+        ordered=sorted([e for e in events.values() if e['kind']=='retry']+list(recent_tasks.values()),key=lambda e:(e['at'],e['id']))
+        if len(ordered)>50000:
+            ordered=ordered[-50000:]
+            source={**source,'state':'incomplete','error':'事件存储达到上限，历史仅为部分记录'}
+        incoming_epoch=payload.get('epoch')
+        samples=payload.get('samples') or []
+        samples=[x for x in samples if isinstance(x,dict) and isinstance(x.get('at'),(int,float)) and isinstance(x.get('ok'),bool)]
+        probe_at=max((x['at'] for x in samples),default=0)
+        interval=30 if any(e['at']>=now-300 for e in ordered) else 120
+        probe=dict(state='ok' if incoming_epoch==epoch and samples else 'unavailable',
+                   observed_at=probe_at,interval=interval,samples=samples if incoming_epoch==epoch else [])
+        diagnosis=project(ordered,proxy,source,probe,{} if changed else prior,now,started)
+        benchmark=payload.get('benchmark') or {}
+        if benchmark.get('epoch')==epoch and started<=benchmark.get('observed_at',0)<=now and now-benchmark.get('observed_at',0)<=600:
+            candidate=benchmark.get('candidate')
+            if candidate and candidate.get('name')!=proxy.get('selected_name'):
+                if diagnosis['can_compare']:
+                    diagnosis['advice']='可尝试：'+candidate['name']
+                diagnosis['evidence'].append('本轮候选：'+candidate['name'])
+                diagnosis['evidence'].append('候选短请求 5/5 成功；长连接稳定性未验证')
+            elif benchmark.get('error'):
+                if diagnosis['can_compare']:
+                    diagnosis['advice']='暂时无法比较候选节点'
+                diagnosis['evidence'].append(benchmark['error'])
+        state.update(selected_name=proxy.get('selected_name'),node_id=proxy.get('node_id'),version=2,route_key=route_key,epoch=epoch,epoch_started=started,environment=proxy.get('environment'),updated=now,
+                     connection_ids=proxy.get('connection_ids',[]),retired_connections=list(retired),
+                     events=ordered,diagnosis_state=diagnosis.pop('state'))
+        # Usage is restricted to this controller environment and monitor session.
+        if changed and state.get('usage_environment')!=[payload.get('session_id'),proxy.get('environment')]:
+            state['usage']={}
+        if proxy.get('certain') and proxy.get('identity_confirmed') and source['state']=='ok':
+            eligible={e['task'] for e in ordered if e['kind']=='output' and e.get('task') and e['at']>=started}
+            retried={e['task'] for e in ordered if e['kind']=='retry' and e['at']>=started}
+            state.setdefault('usage',{})[proxy['selected_name']]={'count':len(eligible-retried),'at':now}
+        state['usage_environment']=[payload.get('session_id'),proxy.get('environment')]
+        save_state(state,path)
+    return dict(schema_version=2,observed_at=now,epoch=epoch,epoch_started=started,
+                source={k:v for k,v in source.items() if k!='events'},proxy={k:v for k,v in proxy.items() if k!='connection_ids'},
+                tun=tun,probe={k:v for k,v in probe.items() if k!='samples'},diagnosis=diagnosis)
 
 
-def _node_for_turn(
-    start_at: float, current_name: str, switches: list[dict[str, Any]]
-) -> str:
-    ordered = sorted(switches, key=lambda item: float(item.get("at") or 0))
-    for item in ordered:
-        switched_at = float(item.get("at") or 0)
-        if start_at < switched_at:
-            previous = item.get("from")
-            return str(previous).strip() if previous else current_name.strip()
-    # 没有发生在该轮次之后的切换时，以当前实际 Selector 为准。
-    # 旧实现会重放历史 target，导致 Clash 中手动切换后，新轮次仍归到旧节点。
-    return current_name.strip()
+def benchmark(payload=None):
+    payload=payload or {}
+    state=load_state()
+    epoch=payload.get('epoch')
+    base=dict(schema_version=2,epoch=epoch,observed_at=time.time(),candidate=None)
+    if not epoch or state.get('epoch')!=epoch:
+        return {**base,'error':'观察范围已变化，请刷新后重试'}
+    proxy,proxies,connections=read_proxy_snapshot()
+    context=resolve_gpt_proxy_context(proxies,connections)
+    if (not context.get('available') or not proxy.get('identity_confirmed') or
+        (proxy.get('environment'),proxy.get('selected_name'),proxy.get('node_id')) !=
+        (state.get('environment'),state.get('selected_name'),state.get('node_id'))):
+        return {**base,'error':context.get('error') or '代理环境已变化'}
+    names=context['candidates']
+    usage={name:item['count'] for name,item in (state.get('usage') or {}).items()
+           if isinstance(item,dict) and isinstance(item.get('count'),int) and 0<=time.time()-item.get('at',0)<=86400}
+    # Cover all candidates with a bounded 60s round; timed-out/incomplete candidates cannot win.
+    deadline=time.monotonic()+60
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+        results=list(pool.map(lambda n:probe_node(n,deadline=deadline),sorted(names,key=lambda n:(-usage.get(n,0),n))))
+    after,_,_=read_proxy_snapshot()
+    if (after.get('environment'),after.get('selected_name'),after.get('certain'))!=(proxy.get('environment'),proxy.get('selected_name'),True) or load_state().get('epoch')!=epoch:
+        return {**base,'error':'测速期间代理已变化，结果已丢弃'}
+    candidate=rank_candidates(results,context['current_name'],usage)
+    return {**base,'observed_at':time.time(),'candidate':candidate,
+            'error':None if candidate else '没有完成五次成功探针的候选',
+            'tested_count':sum(r['sample_count']>0 for r in results),'candidate_count':len(names)}
 
 
-def update_quality_history(
-    history: dict[str, Any],
-    current_name: str | None,
-    turns: list[dict[str, Any]],
-    now: float,
-) -> dict[str, Any]:
-    cutoff = now - QUALITY_WINDOW_SECONDS
-    created_at = float(history.get("created_at") or now)
-    switches = [
-        item for item in history.get("switches", [])
-        if float(item.get("at") or 0) >= cutoff
-    ]
-    current_node = current_name.strip() if current_name else None
-    observed_node = history.get("selected_node")
-    observed_node = str(observed_node).strip() if observed_node else None
-    if observed_node is None and switches:
-        latest_switch = max(switches, key=lambda item: float(item.get("at") or 0))
-        latest_target = latest_switch.get("to")
-        observed_node = str(latest_target).strip() if latest_target else None
-    if current_node and observed_node and current_node != observed_node:
-        # Clash UI / 其他客户端也可以改变 Selector。首次观察到变化时补记切换，
-        # 让正在跨越切换点的会话进入 grace，而后续会话归到当前实际节点。
-        switches.append({
-            "at": now,
-            "from": observed_node,
-            "to": current_node,
-            "source": "observed",
-        })
-    stored = {
-        turn_id: item for turn_id, item in (history.get("turns") or {}).items()
-        if float((item or {}).get("last_seen_at") or 0) >= cutoff
-    }
-    if current_node:
-        for turn in turns:
-            turn_id = str(turn.get("turn_id") or "")
-            start_at = float(turn.get("start_at") or 0)
-            if not turn_id or start_at < created_at or start_at < cutoff:
-                continue
-            previous = stored.get(turn_id) or {}
-            node = str(
-                previous.get("node") or _node_for_turn(start_at, current_node, switches)
-            ).strip()
-            last_seen_at = float(turn.get("last_seen_at") or start_at)
-            overlaps_switch = any(
-                start_at <= float(item.get("at") or 0) + SWITCH_GRACE_SECONDS
-                and last_seen_at >= float(item.get("at") or 0) - 5
-                for item in switches
-            )
-            stored[turn_id] = {
-                "node": node,
-                "start_at": start_at,
-                "last_seen_at": last_seen_at,
-                "has_output": bool(turn.get("has_output")),
-                "retry_count": int(turn.get("retry_count") or 0),
-                "opening_retry_count": int(turn.get("opening_retry_count") or 0),
-                "tls_eof_count": int(turn.get("tls_eof_count") or 0),
-                "connection_closed_count": int(turn.get("connection_closed_count") or 0),
-                "ignored_after_switch": bool(previous.get("ignored_after_switch")) or overlaps_switch,
-            }
-    history.update({
-        "version": 1,
-        "created_at": created_at,
-        "updated": now,
-        "turns": stored,
-        "switches": switches,
-        "selected_node": current_node,
-        "selected_node_observed_at": now if current_node else history.get(
-            "selected_node_observed_at"
-        ),
-    })
-    return history
-
-
-def summarize_node_quality(
-    history: dict[str, Any], node: str, now: float | None = None
-) -> dict[str, Any]:
-    current = time.time() if now is None else now
-    normalized_node = node.strip()
-    records = [
-        item for item in (history.get("turns") or {}).values()
-        if str((item or {}).get("node") or "").strip() == normalized_node
-        and not (item or {}).get("ignored_after_switch")
-        and current - float((item or {}).get("start_at") or 0) <= QUALITY_WINDOW_SECONDS
-        and (
-            (item or {}).get("has_output")
-            or int((item or {}).get("retry_count") or 0) > 0
-            or current - float((item or {}).get("start_at") or 0) > ACTIVITY_SECONDS
-        )
-    ]
-    records.sort(key=lambda item: float(item.get("start_at") or 0), reverse=True)
-    records = records[:QUALITY_MAX_TURNS]
-    turn_count = len(records)
-    retry_turn_count = sum(1 for item in records if int(item.get("retry_count") or 0) > 0)
-    retry_count = sum(int(item.get("retry_count") or 0) for item in records)
-    first_attempt_success_count = sum(
-        1 for item in records
-        if item.get("has_output") and int(item.get("retry_count") or 0) == 0
-    )
-    first_attempt_success_pct = (
-        round(first_attempt_success_count / turn_count * 100) if turn_count else None
-    )
-    max_retries = max((int(item.get("retry_count") or 0) for item in records), default=0)
-    tls_eof_count = sum(int(item.get("tls_eof_count") or 0) for item in records)
-    connection_closed_count = sum(
-        int(item.get("connection_closed_count") or 0) for item in records
-    )
-    hard_failure_count = sum(
-        1 for item in records
-        if not item.get("has_output")
-        and current - float(item.get("start_at") or 0) > ACTIVITY_SECONDS
-    )
-    stable_streak = 0
-    for item in records:
-        if item.get("has_output") and int(item.get("retry_count") or 0) == 0:
-            stable_streak += 1
-        else:
-            break
-    retry_turn_pct = round(retry_turn_count / turn_count * 100) if turn_count else 0
-    severe = max_retries >= 3 or tls_eof_count >= 2 or hard_failure_count > 0
-    unstable_by_rate = (
-        (turn_count >= 5 and retry_turn_pct >= 20)
-        or (turn_count >= QUALITY_MIN_STABLE_TURNS and retry_turn_pct >= 10)
-    )
-    if severe or unstable_by_rate:
-        status = "unstable"
-    elif (
-        turn_count >= QUALITY_MIN_STABLE_TURNS
-        and first_attempt_success_pct is not None
-        and first_attempt_success_pct >= 95
-    ):
-        status = "stable"
-    else:
-        status = "observing"
-    confidence = "high" if turn_count >= 20 else ("medium" if turn_count >= 10 else "low")
-    return {
-        "node": normalized_node,
-        "status": status,
-        "confidence": confidence,
-        "turn_count": turn_count,
-        "required_turn_count": QUALITY_MIN_STABLE_TURNS,
-        "first_attempt_success_pct": first_attempt_success_pct,
-        "retry_turn_count": retry_turn_count,
-        "retry_turn_pct": retry_turn_pct,
-        "retry_count": retry_count,
-        "max_retries_per_turn": max_retries,
-        "opening_retry_count": sum(int(item.get("opening_retry_count") or 0) for item in records),
-        "tls_eof_count": tls_eof_count,
-        "connection_closed_count": connection_closed_count,
-        "hard_failure_count": hard_failure_count,
-        "stable_streak": stable_streak,
-    }
-
-
-def all_node_qualities(
-    history: dict[str, Any], now: float | None = None
-) -> dict[str, dict[str, Any]]:
-    nodes = {
-        str(item.get("node")).strip() for item in (history.get("turns") or {}).values()
-        if (item or {}).get("node")
-    }
-    return {node: summarize_node_quality(history, node, now) for node in nodes}
-
-
-def choose_gpt_recommendation(
-    current_name: str | None,
-    node_results: list[dict[str, Any]],
-    node_qualities: dict[str, dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    qualities = node_qualities or {}
-    successful = [
-        item for item in node_results
-        if isinstance(item.get("median_ms"), int)
-        and item.get("success_count") == item.get("sample_count")
-    ]
-    successful.sort(key=lambda item: (
-        item.get("p90_ms") or 10**9,
-        item["median_ms"],
-        item.get("max_ms") or 10**9,
-    ))
-    current = next((item for item in successful if item["name"] == current_name), None)
-    best = successful[0] if successful else None
-    recommended = None
-    trial = None
-    def node_quality(name: Any) -> dict[str, Any] | None:
-        return qualities.get(str(name or "").strip())
-
-    current_quality = node_quality(current_name) or {
-        "node": current_name,
-        "status": "observing",
-        "confidence": "low",
-        "turn_count": 0,
-        "required_turn_count": QUALITY_MIN_STABLE_TURNS,
-    }
-    current_status = current_quality.get("status")
-    if current is None and current_name:
-        current_status = "unavailable"
-        current_quality = {**current_quality, "status": "unavailable"}
-    if current_status in ("unstable", "unavailable"):
-        stable_candidates = [
-            item for item in successful
-            if item.get("name") != current_name
-            and (node_quality(item.get("name")) or {}).get("status") == "stable"
-        ]
-        stable_candidates.sort(key=lambda item: (
-            -((node_quality(item["name"]) or {}).get("first_attempt_success_pct") or 0),
-            item.get("p90_ms") or 10**9,
-            item.get("median_ms") or 10**9,
-        ))
-        recommended = stable_candidates[0] if stable_candidates else None
-        if recommended is None:
-            trial = next(
-                (item for item in successful
-                 if item.get("name") != current_name
-                 and (node_quality(item.get("name")) or {}).get("status") != "unstable"),
-                None,
-            )
-    return {
-        "current": current,
-        "best": best,
-        "recommended": recommended,
-        "trial": trial,
-        "current_quality": current_quality,
-        "recommendation_kind": "stable" if recommended else ("trial" if trial else None),
-    }
-
-
-def _probe_gpt_node(socket_path: str, name: str) -> dict[str, Any]:
-    encoded_name = urllib.parse.quote(name, safe="")
-    encoded_url = urllib.parse.quote(GPT_PROBE_URL, safe="")
-    path = (
-        f"/proxies/{encoded_name}/delay?url={encoded_url}"
-        f"&timeout={GPT_PROBE_TIMEOUT_MS}"
-    )
-    samples: list[int] = []
-    for _ in range(GPT_PROBE_ROUNDS):
-        try:
-            payload = _unix_http_json(
-                socket_path,
-                path,
-                timeout=GPT_PROBE_TIMEOUT_MS / 1000 + 1,
-            )
-            delay = payload.get("delay")
-            if isinstance(delay, int) and delay > 0:
-                samples.append(delay)
-        except (OSError, ValueError, KeyError, json.JSONDecodeError, socket.timeout):
-            continue
-    ordered = sorted(samples)
-    return {
-        "name": name,
-        "median_ms": round(statistics.median(ordered)) if ordered else None,
-        "p90_ms": round(_percentile(ordered, 0.9)) if ordered else None,
-        "min_ms": ordered[0] if ordered else None,
-        "max_ms": ordered[-1] if ordered else None,
-        "success_count": len(ordered),
-        "sample_count": GPT_PROBE_ROUNDS,
-        "success_pct": round(len(ordered) / GPT_PROBE_ROUNDS * 100),
-    }
-
-
-def probe_gpt_nodes(socket_path: str = MIHOMO_SOCKET) -> dict[str, Any]:
-    """不改变选择器，让每个候选节点分别访问 ChatGPT 真实端点。"""
-    updated = int(time.time())
-    if not os.path.exists(socket_path):
-        return {"available": False, "updated": updated, "error": "Clash Verge 未连接"}
+def main():
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--log-path',default=LOG_PATH)
+    parser.add_argument('--probe-gpt-nodes',action='store_true')
+    parser.add_argument('--input-json',action='store_true')
+    args=parser.parse_args()
+    payload=json.load(sys.stdin) if args.input_json else {}
     try:
-        proxies_payload = _unix_http_json(socket_path, "/proxies", timeout=0.5)
-        context = resolve_gpt_proxy_context(proxies_payload)
-        if not context.get("available"):
-            return {**context, "updated": updated}
-        candidates = context["candidates"]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(candidates))) as pool:
-            results = list(pool.map(lambda name: _probe_gpt_node(socket_path, name), candidates))
-        history = load_quality_history()
-        qualities = all_node_qualities(history, updated)
-        for item in results:
-            normalized_name = str(item["name"]).strip()
-            item["quality"] = qualities.get(normalized_name) or summarize_node_quality(
-                history, normalized_name, updated
-            )
-        ranking = choose_gpt_recommendation(context.get("current_name"), results, qualities)
-        return {
-            "available": True,
-            "updated": updated,
-            "probe_url": GPT_PROBE_URL,
-            "selector": context["selector"],
-            "current_name": context.get("current_name"),
-            "current": ranking["current"],
-            "recommended": ranking["recommended"],
-            "trial": ranking["trial"],
-            "best": ranking["best"],
-            "current_quality": ranking["current_quality"],
-            "recommendation_kind": ranking["recommendation_kind"],
-            "nodes": sorted(
-                results,
-                key=lambda item: (
-                    item["median_ms"] is None,
-                    item["median_ms"] if item["median_ms"] is not None else 10**9,
-                ),
-            ),
-        }
-    except (OSError, ValueError, KeyError, json.JSONDecodeError, socket.timeout) as exc:
-        return {"available": False, "updated": updated, "error": f"GPT 节点测速失败: {exc}"}
+        result=benchmark(payload) if args.probe_gpt_nodes else collect(payload,args.log_path)
+        print(json.dumps(result,ensure_ascii=False,allow_nan=False))
+    except (OSError,ValueError,TypeError):
+        # Parent records exit category only; no raw local paths/content leave this process.
+        raise SystemExit(2)
 
 
-def read_proxy_state(
-    socket_path: str = MIHOMO_SOCKET,
-    app_paths: tuple[str, ...] = CLASH_APP_PATHS,
-) -> dict[str, Any]:
-    if not os.path.exists(socket_path):
-        return {
-            "available": False,
-            "name": None,
-            "source": "unavailable",
-            "detail": clash_unavailable_detail(app_paths),
-        }
-    try:
-        proxies = _unix_http_json(socket_path, "/proxies", timeout=0.4)
-        connections = _unix_http_json(socket_path, "/connections", timeout=0.4)
-        return resolve_proxy_state(proxies, connections)
-    except (OSError, ValueError, KeyError, json.JSONDecodeError):
-        return {
-            "available": False,
-            "name": None,
-            "source": "unavailable",
-            "detail": "Clash Verge 状态不可用",
-        }
-
-
-def collect(log_path: str = LOG_PATH, now: float | None = None) -> dict[str, Any]:
-    current = time.time() if now is None else now
-    proxy = read_proxy_state()
-    codex = read_codex_activity(log_path, current)
-    turns = codex.pop("_turns", [])
-    quality = None
-    quality_node = proxy.get("selected_name") or proxy.get("name")
-    if proxy.get("available") and quality_node:
-        quality_node = str(quality_node).strip()
-        try:
-            with quality_history_lock():
-                history = load_quality_history(now=current)
-                update_quality_history(history, str(quality_node), turns, current)
-                save_quality_history(history)
-            quality = summarize_node_quality(history, str(quality_node), current)
-        except OSError:
-            quality = None
-    return {
-        "updated": int(current),
-        "tun": read_tun_state(),
-        "proxy": proxy,
-        "codex": codex,
-        "gpt_quality": quality,
-    }
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--log-path", default=LOG_PATH)
-    parser.add_argument("--probe-gpt-nodes", action="store_true")
-    args = parser.parse_args()
-    if args.probe_gpt_nodes:
-        result = probe_gpt_nodes()
-    else:
-        result = collect(args.log_path)
-    print(json.dumps(result, ensure_ascii=False))
-
-
-if __name__ == "__main__":
+if __name__=='__main__':
     main()

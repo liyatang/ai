@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/sources.sh"
 USER_HOME="${CODEX_STATUS_TEST_HOME:-$HOME}"
 SUPPORT_DIR="$USER_HOME/.config/quota-widget"
 APP_DIR="$USER_HOME/Applications/Codex 状态.app"
@@ -12,6 +13,16 @@ LEGACY_EXECUTABLE="$LEGACY_APP_DIR/Contents/MacOS/AIQuota"
 if [[ "$(uname -m)" != "arm64" ]]; then
   echo "错误：当前安装包仅支持 Apple Silicon（M 系列芯片）。"
   exit 1
+fi
+
+# 必须在构建、停止旧进程或写入用户目录前检查系统兼容性。
+MIN_OS="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$SCRIPT_DIR/app/Info.plist")"
+OS_VERSION="$(sw_vers -productVersion)"
+autoload -Uz is-at-least
+if ! is-at-least "$MIN_OS" "$OS_VERSION"; then
+  echo "错误：Codex 状态需要 macOS ${MIN_OS} 或更新版本，当前为 ${OS_VERSION}。"
+  echo "未修改现有安装或个人配置。"
+  exit 4
 fi
 
 PYTHON=""
@@ -30,8 +41,8 @@ fi
 
 SOURCE_STAMP="$SCRIPT_DIR/bin/AIQuota.source-sha256"
 if [[ ! -f "$SOURCE_STAMP" ]] || \
-   [[ "$(shasum -a 256 "$SCRIPT_DIR/app/main.swift" | awk '{print $1}')" != "$(tr -d '[:space:]' < "$SOURCE_STAMP")" ]]; then
-  echo "错误：预编译 AIQuota 与 main.swift 不一致，请先运行 ./build.sh。"
+   [[ "$(source_hash)" != "$(tr -d '[:space:]' < "$SOURCE_STAMP")" ]]; then
+  echo "错误：安装包不完整或版本不一致，请获取完整的最新版本后重试。"
   exit 3
 fi
 
@@ -42,24 +53,22 @@ fi
 BUILD_ROOT="$(mktemp -d)"
 cleanup() {
   rm -rf "$BUILD_ROOT"
-  rm -f "$SUPPORT_DIR/quota_fetch.py.next" "$SUPPORT_DIR/diagnostics.py.next"
 }
 trap cleanup EXIT
 BUILD_APP="$BUILD_ROOT/Codex 状态.app"
-mkdir -p "$BUILD_APP/Contents/MacOS"
+mkdir -p "$BUILD_APP/Contents/MacOS" "$BUILD_APP/Contents/Resources"
+for runtime_file in "${RUNTIME_FILES[@]}"; do
+  cp "$SCRIPT_DIR/$runtime_file" "$BUILD_APP/Contents/Resources/$runtime_file"
+done
 cp "$SCRIPT_DIR/app/Info.plist" "$BUILD_APP/Contents/Info.plist"
 cp "$SCRIPT_DIR/bin/AIQuota" "$BUILD_APP/Contents/MacOS/AIQuota"
 chmod 755 "$BUILD_APP/Contents/MacOS/AIQuota"
 codesign --force --sign - "$BUILD_APP" >/dev/null
 codesign --verify --deep --strict "$BUILD_APP"
 
-# 先完成 App 构建与签名验证，再更新运行脚本，避免构建失败时留下新旧版本混用。
+# Python 模块随签名 App 一起更新；旧 App 和旧共享脚本保留用于回退。
 mkdir -p "$USER_HOME/Applications" "$SUPPORT_DIR"
 chmod 700 "$SUPPORT_DIR"
-cp "$SCRIPT_DIR/quota_fetch.py" "$SUPPORT_DIR/quota_fetch.py.next"
-cp "$SCRIPT_DIR/diagnostics.py" "$SUPPORT_DIR/diagnostics.py.next"
-chmod 700 "$SUPPORT_DIR/quota_fetch.py.next" "$SUPPORT_DIR/diagnostics.py.next"
-
 if [[ ! -f "$SUPPORT_DIR/config.json" ]]; then
   cp "$SCRIPT_DIR/config.example.json" "$SUPPORT_DIR/config.json"
 fi
@@ -83,8 +92,6 @@ for existing_app in "$APP_DIR" "$LEGACY_APP_DIR"; do
   echo "旧版本已移到废纸篓：$BACKUP_APP"
 done
 mv "$BUILD_APP" "$APP_DIR"
-mv "$SUPPORT_DIR/quota_fetch.py.next" "$SUPPORT_DIR/quota_fetch.py"
-mv "$SUPPORT_DIR/diagnostics.py.next" "$SUPPORT_DIR/diagnostics.py"
 if [[ "${CODEX_STATUS_SKIP_LAUNCH:-0}" != "1" ]]; then
   open "$APP_DIR"
 fi
@@ -93,7 +100,7 @@ echo ""
 if [[ "${CODEX_STATUS_SKIP_LAUNCH:-0}" == "1" ]]; then
   echo "Codex 状态已安装（未启动）。"
 else
-  echo "Codex 状态已安装并启动。"
+  echo "Codex 状态已安装，已发送启动请求。"
 fi
 echo "App：$APP_DIR"
 echo "Python：$PYTHON"
