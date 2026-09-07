@@ -117,3 +117,31 @@ if ProcessInfo.processInfo.environment["AIQUOTA_TEST_LIVE_RESOURCES"] == "1" {
     print("Live resources: \(live.processCount) processes, CPU \(live.cpuPercent)%, memory \(memory) bytes")
 }
 print("GPT dedicated helper tests passed")
+
+let errorStages: [(Int,String)] = [(NSURLErrorDNSLookupFailed,"dns"), (NSURLErrorCannotFindHost,"dns"),
+    (NSURLErrorCannotConnectToHost,"connect"), (NSURLErrorSecureConnectionFailed,"tls"),
+    (NSURLErrorTimedOut,"timeout"), (NSURLErrorCancelled,"unknown")]
+for (code,stage) in errorStages {
+    require(NetworkProbe.failureStage(NSError(domain:NSURLErrorDomain,code:code)) == stage,"URLSession 错误阶段分类")
+}
+require(NetworkProbe.failureStage(NSError(domain:"other",code:NSURLErrorDNSLookupFailed)) == "unknown","不从其他错误域猜测 DNS")
+require(NetworkProbe.failureStage(NSError(domain:NSURLErrorDomain,code:NSURLErrorTimedOut),requestSent:true) == "response_timeout","发送完成后的超时")
+let legacy = try! JSONDecoder().decode(ProbeSample.self,from:Data("{\"at\":1,\"ok\":false}".utf8))
+require(legacy.stage == nil && legacy.domain == nil,"旧探针字段缺失保留未知")
+let dnsNow = Date().timeIntervalSince1970
+let currentDNS = DNSData(epoch:"B",observed_at:dnsNow,environment:"env",state:"ok",interval:60,
+    results:[DNSResult(domain:"chatgpt.com",route:"direct",state:"error",code:"upstream_timeout",observed_at:dnsNow)])
+require(coordinator.acceptDNS(currentDNS,token:coordinator.generation.current),"当前 DNS 结果应接受")
+let previousDNSToken = coordinator.generation.current
+require(coordinator.acceptDiagnostics(diagnosticFixture(epoch:"C"),token:previousDNSToken),"DNS 观察代次切换")
+require(coordinator.dnsData == nil,"切换清空旧 DNS")
+require(!coordinator.acceptDNS(currentDNS,token:previousDNSToken),"旧 DNS 晚返回丢弃")
+require(!coordinator.acceptDNS(currentDNS,token:coordinator.generation.current),"错误 epoch 即使 token 相同仍拒绝")
+let staleDNS = DNSData(epoch:"C",observed_at:dnsNow-241,environment:"env",state:"ok",interval:120,results:[])
+require(!coordinator.acceptDNS(staleDNS,token:coordinator.generation.current),"过期 DNS 不能回填")
+var dnsRefreshGate = RefreshGate()
+require(dnsRefreshGate.begin(),"DNS 独立开始")
+require(!dnsRefreshGate.begin() && !dnsRefreshGate.begin(),"连续 DNS 刷新合并")
+require(dnsRefreshGate.finish(),"DNS 只补一次刷新")
+require(dnsRefreshGate.begin() && !dnsRefreshGate.finish(),"补刷新完成后不循环")
+print("DNS/TLS lifecycle and compatibility tests passed")

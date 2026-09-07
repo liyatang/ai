@@ -49,6 +49,7 @@ struct Diagnosis: Codable {
     let active: Bool
     let can_compare: Bool
     let evidence: [String]
+    var short_title: String? = nil
 }
 struct DiagnosticsData: Codable {
     let schema_version: Int
@@ -68,6 +69,24 @@ struct ProbeSample: Codable {
     let at: Double
     let latency_ms: Double?
     let ok: Bool
+    var domain: String? = nil
+    var stage: String? = nil
+    var http_status: Int? = nil
+}
+struct DNSResult: Codable {
+    let domain: String
+    let route: String
+    let state: String
+    let code: String
+    let observed_at: Double
+}
+struct DNSData: Codable {
+    let epoch: String?
+    let observed_at: Double
+    let environment: String
+    let state: String
+    let interval: Double
+    let results: [DNSResult]
 }
 struct Candidate: Codable { let name: String; let median_ms: Int?; let p90_ms: Int? }
 struct Benchmark: Codable {
@@ -82,6 +101,8 @@ struct DiagnosticInput: Codable {
     let epoch: String?
     let samples: [ProbeSample]
     let benchmark: Benchmark?
+    var dns: DNSData? = nil
+    var dns_interval: Int? = nil
 }
 
 struct GenerationGate {

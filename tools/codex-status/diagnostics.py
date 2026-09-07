@@ -13,6 +13,8 @@ import sys
 import time
 from pathlib import Path
 from status_logs import read_events, LOG_PATH
+from status_dns import check_dns
+from status_proxy import dns_environment_stamp
 from status_proxy import read_proxy_snapshot, read_tun_state, resolve_gpt_proxy_context, probe_node
 from status_engine import project, rank_candidates
 
@@ -117,7 +119,10 @@ def collect(payload=None,log_path=LOG_PATH,path=STATE_PATH,now=None):
         interval=30 if any(e['at']>=now-300 for e in ordered) else 120
         probe=dict(state='ok' if incoming_epoch==epoch and samples else 'unavailable',
                    observed_at=probe_at,interval=interval,samples=samples if incoming_epoch==epoch else [])
-        diagnosis=project(ordered,proxy,source,probe,{} if changed else prior,now,started)
+        dns=payload.get('dns') or {}
+        if dns.get('epoch') != epoch or dns.get('environment') != dns_environment_stamp():
+            dns={}
+        diagnosis=project(ordered,proxy,source,probe,{} if changed else prior,now,started,dns=dns)
         benchmark=payload.get('benchmark') or {}
         if benchmark.get('epoch')==epoch and started<=benchmark.get('observed_at',0)<=now and now-benchmark.get('observed_at',0)<=600:
             candidate=benchmark.get('candidate')
@@ -144,7 +149,7 @@ def collect(payload=None,log_path=LOG_PATH,path=STATE_PATH,now=None):
         save_state(state,path)
     return dict(schema_version=2,observed_at=now,epoch=epoch,epoch_started=started,
                 source={k:v for k,v in source.items() if k!='events'},proxy={k:v for k,v in proxy.items() if k!='connection_ids'},
-                tun=tun,probe={k:v for k,v in probe.items() if k!='samples'},diagnosis=diagnosis)
+                tun=tun,probe={k:v for k,v in probe.items() if k!='samples'},diagnosis=diagnosis,dns=dns)
 
 
 def benchmark(payload=None):
@@ -180,11 +185,12 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--log-path',default=LOG_PATH)
     parser.add_argument('--probe-gpt-nodes',action='store_true')
+    parser.add_argument('--check-dns',action='store_true')
     parser.add_argument('--input-json',action='store_true')
     args=parser.parse_args()
     payload=json.load(sys.stdin) if args.input_json else {}
     try:
-        result=benchmark(payload) if args.probe_gpt_nodes else collect(payload,args.log_path)
+        result=check_dns(payload) if args.check_dns else benchmark(payload) if args.probe_gpt_nodes else collect(payload,args.log_path)
         print(json.dumps(result,ensure_ascii=False,allow_nan=False))
     except (OSError,ValueError,TypeError):
         # Parent records exit category only; no raw local paths/content leave this process.

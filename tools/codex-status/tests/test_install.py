@@ -55,7 +55,7 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("未启动", result.stdout)
                 self.assertTrue((app / "Contents/MacOS/AIQuota").is_file())
-                for name in ["diagnostics.py", "quota_fetch.py", "status_engine.py", "status_logs.py", "status_proxy.py"]:
+                for name in ["diagnostics.py", "quota_fetch.py", "status_engine.py", "status_logs.py", "status_proxy.py", "status_dns.py"]:
                     self.assertTrue((app / "Contents/Resources" / name).is_file())
                 self.assertEqual(config.read_text(), '{"keep": true}')
                 backups = list((root / "user/.Trash").glob("*/sentinel"))

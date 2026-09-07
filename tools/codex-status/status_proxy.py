@@ -14,6 +14,7 @@ def _unix_http_request(
     timeout: float = 0.25,
     method: str = "GET",
     payload: dict[str, Any] | None = None,
+    raise_for_status: bool = True,
 ) -> tuple[int, bytes]:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(timeout)
@@ -44,7 +45,7 @@ def _unix_http_request(
         status = int(status_line.split(b" ", 2)[1])
         if b"transfer-encoding: chunked" in headers.lower():
             body = _decode_chunked(body)
-        if status >= 400:
+        if status >= 400 and raise_for_status:
             raise OSError(f"mihomo HTTP {status}")
         return status, body
     finally:
@@ -195,7 +196,7 @@ def read_proxy_snapshot(socket_path=MIHOMO_SOCKET, configured_group=None):
         stat = os.stat(socket_path)
         # Dynamic histories, alive and now values are deliberately excluded from the environment.
         topology = sorted((n, v.get('type'), tuple(v.get('all') or []), v.get('id')) for n,v in proxies.get('proxies',{}).items())
-        environment = hashlib.sha256(json.dumps([stat.st_ino, stat.st_ctime_ns, topology], ensure_ascii=False).encode()).hexdigest()[:24]
+        environment = hashlib.sha256(json.dumps([stat.st_ino, stat.st_ctime_ns, topology, dns_environment_stamp(socket_path)], ensure_ascii=False).encode()).hexdigest()[:24]
         state['environment'] = environment
         state['identity_confirmed'] = bool((proxies.get('proxies',{}).get(state.get('selected_name')) or {}).get('id'))
         state['node_id'] = (proxies.get('proxies',{}).get(state.get('selected_name')) or {}).get('id')
@@ -224,3 +225,18 @@ def probe_node(name, socket_path=MIHOMO_SOCKET, deadline=None):
     return dict(name=name, sample_count=attempted, success_count=len(values),
                 median_ms=values[len(values)//2] if values else None,
                 p90_ms=values[round((len(values)-1)*.9)] if values else None)
+
+
+def dns_environment_stamp(socket_path=MIHOMO_SOCKET):
+    # Metadata only: never read controller secrets, subscription contents or auth.
+    base = os.path.expanduser('~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev')
+    paths = [socket_path] + [os.path.join(base, p) for p in
+             ('clash-verge.yaml', 'dns_config.yaml', 'profiles/Merge.yaml')]
+    stamps = []
+    for path in paths:
+        try:
+            info = os.stat(path)
+            stamps.append((info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size))
+        except OSError:
+            stamps.append(None)
+    return hashlib.sha256(json.dumps(stamps).encode()).hexdigest()[:24]

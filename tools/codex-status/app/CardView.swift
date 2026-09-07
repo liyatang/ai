@@ -18,7 +18,7 @@ class CardView: NSView {
     var latencySamples: [(at: Date, latencyMs: Double?, ok: Bool)] = []
     override var isFlipped: Bool { true }
     var currentFresh: Bool { !diagnosticsStale && diagnostics?.isFresh() == true }
-    var displayedTitle: String { currentFresh ? diagnostics!.diagnosis.title : "连接数据已过期" }
+    var displayedTitle: String { currentFresh ? (diagnostics!.diagnosis.short_title ?? diagnostics!.diagnosis.title) : "连接数据已过期" }
     var displayedAdvice: String { currentFresh ? diagnostics!.diagnosis.advice : "等待采集恢复" }
     var currentColor: NSColor {
         guard currentFresh else { return dimColor }
@@ -32,7 +32,7 @@ class CardView: NSView {
     func refreshTooltip() {
         guard let d = diagnostics else { toolTip = "等待连接采集"; return }
         let historical = d.diagnosis.last_retry_at.map { timeFormatter.string(from: Date(timeIntervalSince1970: $0)) } ?? "无"
-        toolTip = (["节点：\(d.proxy.name ?? "未知")", "选中：\(d.proxy.selected_name ?? "未知")",
+        toolTip = (["结论：\(d.diagnosis.title)", "节点：\(d.proxy.name ?? "未知")", "选中：\(d.proxy.selected_name ?? "未知")",
                     "活连接：\(d.proxy.active_name ?? "未知")", "建议：\(displayedAdvice)",
                     "已观察历史（最多 24 小时）：后台重试 \(d.diagnosis.history_count) 次；最后 \(historical)",
                     "历史累计不参与当前告警；新版开始观察前的记录不自动归属节点。"] + d.diagnosis.evidence).joined(separator: "\n")
@@ -81,8 +81,11 @@ class CardView: NSView {
         text(updated, x: 198, y: 21, width: 114, size: 10, color: dimColor, right: true)
         divider(48)
         currentColor.setFill(); NSBezierPath(ovalIn: NSRect(x: padX, y: 66, width: 8, height: 8)).fill()
-        text(diagnostics == nil ? "正在观察连接" : displayedTitle, x: padX+17, y: 58, width: w-17,
-             size: 20, color: currentColor, weight: .semibold)
+        let title = diagnostics == nil ? "正在观察连接" : displayedTitle
+        let titleWidth = (title as NSString).size(withAttributes:[.font:NSFont.systemFont(ofSize:20,weight:.semibold)]).width
+        let titleSize = min(20, max(14, 20*(w-17)/max(1,titleWidth)))
+        text(title, x: padX+17, y: 58, width: w-17,
+             size: titleSize, color: currentColor, weight: .semibold)
         let count = currentFresh ? diagnostics?.diagnosis.retry_count.map(String.init) ?? "—" : "—"
         text("近 5 分钟 · 后台重试 \(count) 次", x: padX, y: 88, width: w, size: 11, color: faintColor)
         row(currentFresh || diagnostics == nil ? "节点" : "上次节点", diagnostics?.proxy.name ?? "等待路由样本", y: 116)
