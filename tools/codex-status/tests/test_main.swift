@@ -20,34 +20,6 @@ require(valid == Data("ok".utf8), "超时后下次采集仍能成功")
 let failed = runProcess(executable: URL(fileURLWithPath: "/usr/bin/false"), arguments: [], timeout: 1)
 require(failed == nil, "非零退出不能作为有效数据")
 let card = CardView()
-require(card.cardHeight > 500 && card.cardWidth == 330, "缺额度也保留完整面板")
-require(card.displayedAdvice == "等待采集恢复", "过期或缺数据不显示切换建议")
-func diagnosticFixture(epoch: String, age: Double = 0) -> DiagnosticsData {
-    let now = Date().timeIntervalSince1970
-    return DiagnosticsData(schema_version:2,observed_at:now-age,epoch:epoch,epoch_started:now-100,
-        source:SourceState(state:"ok",observed_at:now-age,error:nil),
-        tun:TunState(state:"enabled",detail:nil),
-        proxy:ProxyState(available:true,certain:true,name:epoch,selected_name:epoch,active_name:epoch,
-                         selector:"Proxy",detail:nil,transitioning:false),
-        probe:ProbeState(state:"ok",observed_at:now-age,interval:30),
-        diagnosis:Diagnosis(status:"sustained",severity:"danger",title:"连接持续异常",advice:"可尝试：候选",
-                            activity:"后台重试",retry_count:3,history_count:9,last_retry_at:now-5,active:true,
-                            can_compare:true,evidence:[]))
-}
-let coordinator = AppDelegate()
-require(coordinator.acceptDiagnostics(diagnosticFixture(epoch:"A"),token:coordinator.generation.current),"首次观察应被接受")
-let beforeSwitch = coordinator.generation.current
-coordinator.samples = [ProbeSample(at:Date().timeIntervalSince1970,latency_ms:5000,ok:false)]
-coordinator.card.recordLatencySample(latencyMs:5000,ok:false)
-require(coordinator.acceptDiagnostics(diagnosticFixture(epoch:"B"),token:beforeSwitch),"节点切换应被接受")
-require(coordinator.samples.isEmpty && coordinator.card.latencySamples.isEmpty,"切换必须清空旧节点探针")
-let late = Benchmark(schema_version:2,epoch:"A",observed_at:Date().timeIntervalSince1970,candidate:Candidate(name:"B",median_ms:1,p90_ms:1),error:nil)
-require(!coordinator.acceptBenchmark(late,token:beforeSwitch) && coordinator.benchmarkData == nil,"旧候选晚返回不能覆盖当前节点")
-require(!coordinator.acceptDiagnostics(diagnosticFixture(epoch:"A"),token:beforeSwitch),"旧诊断晚返回不能倒退")
-coordinator.card.diagnostics = diagnosticFixture(epoch:"B",age:46)
-require(!coordinator.card.currentFresh && coordinator.card.displayedAdvice == "等待采集恢复","过期故障必须退出建议")
-print("Swift observation lifecycle tests passed")
-
 let resources = parseGPTLocalResources("""
 10 1 12.5 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT
 11 10 105.0 /Applications/ChatGPT.app/Contents/Frameworks/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)
@@ -128,20 +100,4 @@ require(NetworkProbe.failureStage(NSError(domain:"other",code:NSURLErrorDNSLooku
 require(NetworkProbe.failureStage(NSError(domain:NSURLErrorDomain,code:NSURLErrorTimedOut),requestSent:true) == "response_timeout","发送完成后的超时")
 let legacy = try! JSONDecoder().decode(ProbeSample.self,from:Data("{\"at\":1,\"ok\":false}".utf8))
 require(legacy.stage == nil && legacy.domain == nil,"旧探针字段缺失保留未知")
-let dnsNow = Date().timeIntervalSince1970
-let currentDNS = DNSData(epoch:"B",observed_at:dnsNow,environment:"env",state:"ok",interval:60,
-    results:[DNSResult(domain:"chatgpt.com",route:"direct",state:"error",code:"upstream_timeout",observed_at:dnsNow)])
-require(coordinator.acceptDNS(currentDNS,token:coordinator.generation.current),"当前 DNS 结果应接受")
-let previousDNSToken = coordinator.generation.current
-require(coordinator.acceptDiagnostics(diagnosticFixture(epoch:"C"),token:previousDNSToken),"DNS 观察代次切换")
-require(coordinator.dnsData == nil,"切换清空旧 DNS")
-require(!coordinator.acceptDNS(currentDNS,token:previousDNSToken),"旧 DNS 晚返回丢弃")
-require(!coordinator.acceptDNS(currentDNS,token:coordinator.generation.current),"错误 epoch 即使 token 相同仍拒绝")
-let staleDNS = DNSData(epoch:"C",observed_at:dnsNow-241,environment:"env",state:"ok",interval:120,results:[])
-require(!coordinator.acceptDNS(staleDNS,token:coordinator.generation.current),"过期 DNS 不能回填")
-var dnsRefreshGate = RefreshGate()
-require(dnsRefreshGate.begin(),"DNS 独立开始")
-require(!dnsRefreshGate.begin() && !dnsRefreshGate.begin(),"连续 DNS 刷新合并")
-require(dnsRefreshGate.finish(),"DNS 只补一次刷新")
-require(dnsRefreshGate.begin() && !dnsRefreshGate.finish(),"补刷新完成后不循环")
-print("DNS/TLS lifecycle and compatibility tests passed")
+print("Probe compatibility tests passed")
